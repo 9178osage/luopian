@@ -26,9 +26,9 @@ const zh = {
   cookie: "Cookie",
   cookieHint: "会员或登录内容",
   cookieImage:
-    "X 和 Pixiv 的原图通常要登录。把 Netscape 格式的 cookies.txt 贴进来，相当于 --cookies。--cookies-from-browser 读不到你电脑上的浏览器。",
+    "X 和 Pixiv 的原图通常要登录。Studio 请把 Netscape 格式的 cookies.txt 贴进来（--cookies）。本机终端可用 luopian --cookies-from-browser；Studio 界面暂不提供读浏览器 Cookie。",
   cookieVideo:
-    "这里读不到你电脑上的 Safari 或 Chrome。把 Netscape 格式的 cookies.txt 贴进来，相当于命令里的 --cookies。本机那条 --cookies-from-browser 不会在这台下载台上生效。",
+    "Studio 读不到本机 Safari/Chrome。请把 Netscape 格式的 cookies.txt 贴进来（--cookies）。终端可用 luopian --cookies-from-browser；Studio 界面暂不提供该选项。",
   pixivToken: "Pixiv refresh token",
   pixivHelp: "Pixiv 原图要这个。在你自己的电脑上运行 gallery-dl oauth:pixiv，把 token 贴进来。X 用上面的 Cookie。",
   downloading: "下载中",
@@ -100,6 +100,8 @@ const zh = {
   jobMissing: "任务不存在",
   fileMissing: "文件不存在",
   requestIncomplete: "请求不完整",
+  requestNeedJson: "请求需要 Content-Type: application/json",
+  requestForbidden: "来源不被允许",
   pageBroke: "页面中断了",
   pageRetry: "出了点问题。刷新页面后再试。",
   presetLog: (id: string) => `规格 ${id}`,
@@ -129,9 +131,9 @@ const en: typeof zh = {
   cookie: "Cookies",
   cookieHint: "Login or members",
   cookieImage:
-    "X and Pixiv originals usually need a login. Paste a Netscape cookies.txt. That is --cookies. This desk cannot read the browser on your computer.",
+    "X and Pixiv originals usually need a login. In Studio, paste a Netscape cookies.txt (--cookies). On your machine the CLI supports luopian --cookies-from-browser; Studio has no browser-cookie button yet.",
   cookieVideo:
-    "This desk cannot read Safari or Chrome on your computer. Paste a Netscape cookies.txt, the same as --cookies. --cookies-from-browser only works on your own machine.",
+    "Studio cannot read Safari or Chrome on your computer. Paste a Netscape cookies.txt (--cookies). The CLI supports --cookies-from-browser locally; Studio does not expose that option yet.",
   pixivToken: "Pixiv refresh token",
   pixivHelp: "Pixiv originals need this. On your computer run gallery-dl oauth:pixiv and paste the token. X uses the cookies above.",
   downloading: "Downloading",
@@ -205,6 +207,8 @@ const en: typeof zh = {
   jobMissing: "That job doesn’t exist",
   fileMissing: "That file doesn’t exist",
   requestIncomplete: "The request is incomplete",
+  requestNeedJson: "Content-Type must be application/json",
+  requestForbidden: "That origin is not allowed",
   pageBroke: "This page stopped",
   pageRetry: "Something went wrong. Refresh and try again.",
   presetLog: (id: string) => `preset ${id}`,
