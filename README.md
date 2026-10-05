@@ -5,7 +5,7 @@ Paste a link to download, from the terminal or as a desktop app.
 落片是「粘贴链接就下载」：终端走 `luopian`，桌面窗口走同一套界面。两条路保存位置不同。
 
 - **终端**：直接存到系统的「下载」文件夹（`~/Downloads`）。可用 `LUOPIAN_OUT` 或 `-o` 改。
-- **桌面**：先下到应用数据里的任务目录（Mac：`~/Library/Application Support/Luopian/jobs`；Windows：`%LOCALAPPDATA%\Luopian\jobs`），完成后点「保存到电脑」，由 `/api/jobs/…/file` 把文件交出去。Electron 没有写死保存位置，系统对话框一般会落到「下载」，但代码没有保证这一点。任务目录大约 3 小时后清理，最多留 8 个已结束任务，不是最终存放处。
+- **桌面**：先下到应用数据里的任务目录（Mac：`~/Library/Application Support/Luopian/jobs`；Windows：`%LOCALAPPDATA%\Luopian\jobs`），完成后点「保存到电脑」，由 `/api/jobs/…/file` 把文件交出去。Electron 没有写死保存位置，系统对话框一般会落到「下载」，但代码没有保证这一点。任务目录大约 3 小时后清理，最多留 8 个已结束任务（启动时也会扫盘，重启后照样生效），不是最终存放处。
 
 ## 能下什么
 

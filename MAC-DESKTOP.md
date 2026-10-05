@@ -34,9 +34,9 @@ cd ~/Desktop/落片-mac
 npm run electron:dev
 ```
 
-Spawns Vite `:8080` and opens a 落片 window.
+Spawns Vite on `127.0.0.1:8080` (loopback only) and opens a 落片 window.
 
-Downloads first land in the job directory (`~/Library/Application Support/Luopian/jobs` on Mac; `%LOCALAPPDATA%\Luopian\jobs` on Windows). Click 「保存到电脑」 to take the file out via `/api/jobs/…/file`. Electron does not hardcode a save folder; the system dialog usually offers Downloads, but that is not guaranteed in code. Job dirs are cleaned after about 3 hours (max 8 finished jobs) and are not permanent storage.
+Downloads first land in the job directory (`~/Library/Application Support/Luopian/jobs` on Mac; `%LOCALAPPDATA%\Luopian\jobs` on Windows). Click 「保存到电脑」 to take the file out via `/api/jobs/…/file`. Electron does not hardcode a save folder; the system dialog usually offers Downloads, but that is not guaranteed in code. Job dirs are cleaned after about 3 hours (max 8 finished jobs; pruned on startup across restarts) and are not permanent storage. Cookies written for a job are deleted when the job finishes.
 
 Unsigned build (optional):
 
