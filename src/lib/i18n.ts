@@ -40,13 +40,14 @@ const zh = {
   items: (n: number | string) => `${n} 条`,
   previewItems: (n: number) => `预览 ${n} 条`,
   emptyTitle: "还没有任务",
-  emptyBody: "贴上视频、推文或 Pixiv 链接。下载完成即可保存到电脑。",
+  emptyBody: "贴上视频、推文或 Pixiv 链接。文件先下到任务目录，完成后点「保存到电脑」。",
   running: "正在下载",
   ready: "可以保存",
   canceled: "已取消",
   failed: "没有完成",
   working: "处理中",
   save: "保存到电脑",
+  saveHint: "文件还在任务目录里。点「保存到电脑」才会交出去，任务目录不是最终存放处。",
   cancel: "取消",
   recent: "最近的链接",
   footer: "只下载你有权保存的内容。",
@@ -142,13 +143,14 @@ const en: typeof zh = {
   items: (n: number | string) => `${n} items`,
   previewItems: (n: number) => `Preview ${n}`,
   emptyTitle: "Nothing yet",
-  emptyBody: "Paste a video, tweet, or Pixiv link. Save the file when it finishes.",
+  emptyBody: "Paste a video, tweet, or Pixiv link. Files go to a job folder first. Click Save when it finishes.",
   running: "Downloading",
   ready: "Ready to save",
   canceled: "Canceled",
   failed: "Didn’t finish",
   working: "Working",
   save: "Save",
+  saveHint: "The file is still in the job folder. Click Save to take it out. That folder is not the final location.",
   cancel: "Cancel",
   recent: "Recent links",
   footer: "Only download what you have the right to save.",
@@ -211,7 +213,6 @@ const en: typeof zh = {
 };
 
 export type Copy = typeof zh;
-
 
 /** How to install yt-dlp, ffmpeg, and gallery-dl on the OS that is actually running. */
 export function toolInstallHint(locale: Locale): string {

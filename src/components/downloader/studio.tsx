@@ -702,17 +702,22 @@ export function Studio() {
 
             {job ? (
               <div className="mt-5 border-t border-line pt-4" aria-live="polite">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-medium">
-                    {job.status === "running"
-                      ? phrases.running
-                      : job.status === "done"
-                        ? phrases.ready
-                        : job.status === "canceled"
-                          ? phrases.canceled
-                          : phrases.failed}
-                  </p>
-                  <p className="font-mono text-xs tabular-nums text-muted">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium">
+                      {job.status === "running"
+                        ? phrases.running
+                        : job.status === "done"
+                          ? phrases.ready
+                          : job.status === "canceled"
+                            ? phrases.canceled
+                            : phrases.failed}
+                    </p>
+                    {job.status === "done" ? (
+                      <p className="mt-1 text-xs text-muted">{phrases.saveHint}</p>
+                    ) : null}
+                  </div>
+                  <p className="shrink-0 font-mono text-xs tabular-nums text-muted">
                     {job.percent != null ? `${Math.round(job.percent)}%` : job.status === "running" ? phrases.working : ""}
                     {job.speed ? ` · ${job.speed}` : ""}
                     {job.eta ? ` · ${job.eta}` : ""}
