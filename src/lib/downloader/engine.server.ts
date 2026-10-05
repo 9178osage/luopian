@@ -263,6 +263,21 @@ function isYoutube(url: string): boolean {
 function killGroup(child: ChildProcess | null) {
   if (!child?.pid) return;
   const pid = child.pid;
+  if (isWin) {
+    try {
+      spawn("taskkill", ["/T", "/F", "/PID", String(pid)], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+    }
+    return;
+  }
   try {
     process.kill(-pid, "SIGTERM");
   } catch {
@@ -283,6 +298,48 @@ function killGroup(child: ChildProcess | null) {
       }
     }
   }, 1200);
+}
+
+function spawnOpts(extra: { detached?: boolean } = {}): {
+  env: NodeJS.ProcessEnv;
+  detached: boolean;
+  windowsHide: boolean;
+} {
+  return {
+    env: childEnv(),
+    detached: extra.detached ?? true,
+    windowsHide: true,
+  };
+}
+
+/** Delete cookies / gallery secrets left in a job folder. */
+async function scrubJobSecrets(dir: string) {
+  await rm(path.join(dir, "cookies.txt"), { force: true }).catch(() => undefined);
+  await rm(path.join(dir, "gallery-config.json"), { force: true }).catch(() => undefined);
+}
+
+/** Kill every in-flight download (Electron quit / Vite SIGTERM). */
+export function killAllRunningJobs() {
+  for (const job of store.jobs.values()) {
+    if (job.status !== "running") continue;
+    job.status = "canceled";
+    job.error = copy(job.locale).canceled;
+    killGroup(job.child);
+    job.child = null;
+    void scrubJobSecrets(job.dir);
+  }
+}
+
+let quitHooksInstalled = false;
+function installQuitHooks() {
+  if (quitHooksInstalled) return;
+  quitHooksInstalled = true;
+  const halt = () => {
+    killAllRunningJobs();
+  };
+  process.once("SIGTERM", halt);
+  process.once("SIGINT", halt);
+  process.once("beforeExit", halt);
 }
 
 class HostDenied extends Error {}
@@ -480,7 +537,7 @@ function disposition(name: string): string {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-async function sweep() {
+async function sweepMemory() {
   const cutoff = Date.now() - 3 * 60 * 60 * 1000;
   for (const [id, job] of store.jobs) {
     if (job.status === "running") continue;
@@ -501,7 +558,64 @@ async function sweep() {
   }
 }
 
+/**
+ * Prune leftover job folders on disk (across restarts): older than ~3h, and
+ * keep at most 8 finished job dirs. Aligns with README. Does not move ROOT.
+ */
+async function pruneDiskJobs() {
+  await mkdir(ROOT, { recursive: true });
+  const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+  let entries;
+  try {
+    entries = await readdir(ROOT, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  type Row = { id: string; dir: string; mtime: number };
+  const kept: Row[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const id = entry.name;
+    const dir = path.join(ROOT, id);
+    const mem = store.jobs.get(id);
+    if (mem?.status === "running") continue;
+    let mtime = 0;
+    try {
+      mtime = (await stat(dir)).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (mtime < cutoff) {
+      store.jobs.delete(id);
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      continue;
+    }
+    kept.push({ id, dir, mtime });
+  }
+  if (kept.length <= 8) return;
+  kept.sort((a, b) => a.mtime - b.mtime);
+  for (const row of kept.slice(0, kept.length - 8)) {
+    if (store.jobs.get(row.id)?.status === "running") continue;
+    store.jobs.delete(row.id);
+    await rm(row.dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function sweep() {
+  await pruneDiskJobs();
+  await sweepMemory();
+}
+
+let startupPruneStarted = false;
+function ensureStartupPrune() {
+  if (startupPruneStarted) return;
+  startupPruneStarted = true;
+  installQuitHooks();
+  void pruneDiskJobs();
+}
+
 export async function getEngineInfo(): Promise<EngineInfo> {
+  ensureStartupPrune();
   if (engineCache && Date.now() - engineCache.at < 60_000) return engineCache.info;
   let version: string | null = null;
   try {
@@ -671,7 +785,7 @@ async function probeImages(url: string, locale: Locale): Promise<ProbeResult> {
   ];
   const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const cmd = galleryCmd(galleryArgs);
-    const child = spawn(cmd.bin, cmd.args, { env: childEnv(), detached: true });
+    const child = spawn(cmd.bin, cmd.args, spawnOpts());
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
@@ -737,7 +851,7 @@ export async function probeUrl(raw: string, locale: Locale = "zh"): Promise<Prob
 
   const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const cmd = ytdlpCmd(args);
-    const child = spawn(cmd.bin, cmd.args, { env: childEnv(), detached: true });
+    const child = spawn(cmd.bin, cmd.args, spawnOpts());
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
@@ -792,6 +906,7 @@ export type JobRequest = {
 export async function startJob(input: JobRequest): Promise<JobView> {
   const locale = parseLocale(input.lang);
   const phrases = copy(locale);
+  ensureStartupPrune();
   const info = await getEngineInfo();
   if ([...store.jobs.values()].some((job) => job.status === "running")) {
     throw new Error(phrases.busy);
@@ -807,7 +922,7 @@ export async function startJob(input: JobRequest): Promise<JobView> {
   } else if (!info.ytdlp) {
     throw new Error(`${phrases.noYtdlp} ${install}`);
   }
-  if ((preset === "mp3" || preset === "audio" || preset === "subs") && !info.ffmpeg) {
+  if ((preset === "mp3" || preset === "audio" || preset === "subs" || preset === "hd1080") && !info.ffmpeg) {
     throw new Error(`${phrases.noFfmpeg} ${install}`);
   }
   const cookies = (input.cookies ?? "").replaceAll("\0", "").slice(0, 200_000);
@@ -909,7 +1024,7 @@ export async function startJob(input: JobRequest): Promise<JobView> {
   rawArgs.push(url);
 
   const cmd = image ? galleryCmd(rawArgs) : ytdlpCmd(rawArgs);
-  const child = spawn(cmd.bin, cmd.args, { env: childEnv(), detached: true });
+  const child = spawn(cmd.bin, cmd.args, spawnOpts());
   job.child = child;
   attachPipes(job, child);
 
@@ -930,7 +1045,7 @@ export async function startJob(input: JobRequest): Promise<JobView> {
         killGroup(child);
       }
     },
-    (image ? Boolean(range) : preset === "playlist") ? 20 * 60 * 1000 : 12 * 60 * 1000,
+    image || preset === "playlist" ? 20 * 60 * 1000 : 12 * 60 * 1000,
   );
 
   child.on("error", (error) => {
@@ -954,22 +1069,26 @@ export async function startJob(input: JobRequest): Promise<JobView> {
 async function finishJob(job: Job) {
   if (job.settled || job.status === "canceled") {
     job.settled = true;
+    await scrubJobSecrets(job.dir);
     return;
   }
   job.settled = true;
   if (job.halted) {
     job.status = "error";
+    await scrubJobSecrets(job.dir);
     await rm(job.dir, { recursive: true, force: true }).catch(() => undefined);
     return;
   }
   const files = (await walk(job.dir)).filter(deliverable);
   if (job.error && files.length === 0) {
     job.status = "error";
+    await scrubJobSecrets(job.dir);
     return;
   }
   if (files.length === 0) {
     job.status = "error";
     job.error = job.error ?? friendlyError(job.log.at(-1) ?? copy(job.locale).noFile, job.locale);
+    await scrubJobSecrets(job.dir);
     return;
   }
   try {
@@ -996,6 +1115,7 @@ async function finishJob(job: Job) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : copy(job.locale).packFail;
   }
+  await scrubJobSecrets(job.dir);
 }
 
 export function getJob(id: string): JobView | null {
@@ -1010,6 +1130,8 @@ export function cancelJob(id: string): JobView | null {
     job.status = "canceled";
     job.error = copy(job.locale).canceled;
     killGroup(job.child);
+    job.child = null;
+    void scrubJobSecrets(job.dir);
   }
   return publicJob(job);
 }
@@ -1037,3 +1159,5 @@ export async function openJobFile(id: string, locale: Locale = "zh"): Promise<Re
     },
   });
 }
+
+ensureStartupPrune();
