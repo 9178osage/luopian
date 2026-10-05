@@ -16,7 +16,7 @@ echo "https://..." | luopian
 
 - Binary: `~/.local/bin/luopian` → `~/Desktop/落片-mac/bin/luopian.mjs`
 - Also: `~/bin/luopian`
-- Saves to: `~/Downloads`
+- Saves to: `~/Downloads` (override with `LUOPIAN_OUT` or `-o`)
 - Uses Homebrew: `yt-dlp`, `ffmpeg`, `gallery-dl`
 
 If `luopian` not found:
@@ -36,6 +36,8 @@ npm run electron:dev
 
 Spawns Vite `:8080` and opens a 落片 window.
 
+Downloads first land in the job directory (`~/Library/Application Support/Luopian/jobs` on Mac; `%LOCALAPPDATA%\Luopian\jobs` on Windows). Click 「保存到电脑」 to take the file out via `/api/jobs/…/file`. Electron does not hardcode a save folder; the system dialog usually offers Downloads, but that is not guaranteed in code. Job dirs are cleaned after about 3 hours (max 8 finished jobs) and are not permanent storage.
+
 Unsigned build (optional):
 
 ```bash
@@ -51,7 +53,7 @@ npm run dist:mac
 
 ## Windows
 
-Same app: paste a link, same numbered menus, `luopian lang zh|en`, save to that user's Downloads folder (not a 落片 subfolder).
+Same menus and language switch as Mac. Terminal saves to that user's Downloads. Desktop still uses the job directory first, then 「保存到电脑」.
 
 Requirements: Node, plus `yt-dlp`, `ffmpeg`, and `gallery-dl` on PATH. Install with winget (`yt-dlp.yt-dlp`, `yt-dlp.FFmpeg`, `mikf.gallery-dl`) or scoop (`scoop install yt-dlp ffmpeg gallery-dl`).
 

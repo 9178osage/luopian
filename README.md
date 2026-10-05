@@ -2,7 +2,10 @@
 
 Paste a link to download, from the terminal or as a desktop app.
 
-落片是一个「粘贴链接就下载」的工具，同一套用法：终端命令 `luopian`，以及 Electron 桌面窗口。默认保存到系统的「下载」文件夹（`~/Downloads`），不会再套一层 `落片` 子目录。
+落片是「粘贴链接就下载」：终端走 `luopian`，桌面窗口走同一套界面。两条路保存位置不同。
+
+- **终端**：直接存到系统的「下载」文件夹（`~/Downloads`）。可用 `LUOPIAN_OUT` 或 `-o` 改。
+- **桌面**：先下到应用数据里的任务目录（Mac：`~/Library/Application Support/Luopian/jobs`；Windows：`%LOCALAPPDATA%\Luopian\jobs`），完成后点「保存到电脑」，由 `/api/jobs/…/file` 把文件交出去。Electron 没有写死保存位置，系统对话框一般会落到「下载」，但代码没有保证这一点。任务目录大约 3 小时后清理，最多留 8 个已结束任务，不是最终存放处。
 
 ## 能下什么
 
@@ -25,11 +28,11 @@ luopian
 luopian "https://www.youtube.com/watch?v=..."
 ```
 
-桌面：`npm run electron:dev`，或已安装的「落片」应用（Launchpad）。保存位置是 `~/Downloads`。
+桌面：`npm run electron:dev`，或已安装的「落片」应用（Launchpad）。文件先下到任务目录，再点「保存到电脑」。
 
 ## Windows
 
-用法和 Mac 相同（同样的菜单、语言开关、保存到当前用户的 Downloads）。差别只在于怎么找到工具：先查 PATH，再看 winget / scoop / chocolatey 的常见安装位置。
+用法和 Mac 相同（同样的菜单、语言开关）。终端直接存当前用户的 Downloads；桌面同样先下到任务目录，再点「保存到电脑」。差别只在于怎么找到工具：先查 PATH，再看 winget / scoop / chocolatey 的常见安装位置。
 
 需要已安装 Node、`yt-dlp`、`ffmpeg`、`gallery-dl`。例如：
 
