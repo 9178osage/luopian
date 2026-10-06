@@ -115,6 +115,7 @@
       "output": "release"
     },
     "asar": false,
+    "afterPack": "./scripts/after-pack-vendor.cjs",
     "files": [
       "electron/**/*",
       "scripts/**/*",
