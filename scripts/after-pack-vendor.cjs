@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports -- electron-builder loads this hook as CommonJS */
 // electron-builder afterPack hook.
 // The desktop app runs the Vite dev server inside the package, which needs
 // packages electron-builder prunes as devDependencies (e.g. nitro's `scule`).
