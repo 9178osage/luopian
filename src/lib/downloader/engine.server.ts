@@ -473,7 +473,7 @@ async function walk(dir: string): Promise<string[]> {
 
 function deliverable(file: string): boolean {
   const base = path.basename(file);
-  if (base === "cookies.txt" || base === "gallery-config.json" || base === "_pack.zip" || base.startsWith(".")) {
+  if (base === "cookies.txt" || base === "gallery-config.json" || base === "_pack.zip" || base === "_pack.list" || base.startsWith(".")) {
     return false;
   }
   if (base.endsWith(".part") || base.endsWith(".ytdl") || base.endsWith(".temp")) return false;
@@ -493,19 +493,63 @@ async function dirBytes(dir: string): Promise<number> {
   return total;
 }
 
+const ZIP_SKIP = new Set(["cookies.txt", "gallery-config.json", "_pack.zip", "_pack.list"]);
+
+async function listZipEntries(root: string, rel = ""): Promise<string[]> {
+  const out: string[] = [];
+  for (const entry of await readdir(path.join(root, rel), { withFileTypes: true })) {
+    const name = entry.name;
+    const child = rel ? path.join(rel, name) : name;
+    if (entry.isDirectory()) out.push(...(await listZipEntries(root, child)));
+    else if (entry.isFile() && !ZIP_SKIP.has(name) && !name.endsWith(".part") && !name.startsWith(".")) {
+      out.push(child);
+    }
+  }
+  return out;
+}
+
+/** bsdtar ships with macOS and Windows 10+ (System32\tar.exe), so no Python is needed. */
+function bsdtarPath(): string | null {
+  if (process.platform === "win32") {
+    const sys = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+    return existsSync(sys) ? sys : null;
+  }
+  if (process.platform === "darwin") return existsSync("/usr/bin/tar") ? "/usr/bin/tar" : null;
+  return which("bsdtar");
+}
+
 async function zipDir(dir: string, dest: string) {
+  const entries = await listZipEntries(dir);
+  const tar = bsdtarPath();
+  if (tar && entries.length > 0) {
+    // Media is already compressed: store entries as-is, UTF-8 names, zip64 when needed.
+    const listFile = path.join(dir, "_pack.list");
+    await writeFile(listFile, entries.join("\0") + "\0");
+    try {
+      await exec(
+        tar,
+        ["--format", "zip", "--options", "zip:compression=store,zip:hdrcharset=UTF-8", "-cf", dest, "-C", dir, "--null", "-T", listFile],
+        { env: childEnv(), timeout: 600000, windowsHide: true },
+      );
+      return;
+    } catch {
+      await rm(dest, { force: true });
+    } finally {
+      await rm(listFile, { force: true });
+    }
+  }
   const script = `
 import os, sys, zipfile
 root, dest = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
     for dirpath, _, names in os.walk(root):
         for name in names:
-            if name in {"cookies.txt", "gallery-config.json", "_pack.zip"} or name.endswith(".part"):
+            if name in {"cookies.txt", "gallery-config.json", "_pack.zip", "_pack.list"} or name.endswith(".part") or name.startswith("."):
                 continue
             full = os.path.join(dirpath, name)
             bundle.write(full, os.path.relpath(full, root))
 `;
-  await exec(PYTHON, ["-c", script, dir, dest], { env: childEnv(), timeout: 120000 });
+  await exec(PYTHON, ["-c", script, dir, dest], { env: childEnv(), timeout: 600000, windowsHide: true });
 }
 
 function contentType(name: string): string {
