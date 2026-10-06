@@ -254,14 +254,26 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  stopServer();
-  if (process.platform !== "darwin") app.quit();
+  // macOS: closing the window keeps the app (and any running download) alive,
+  // so clicking the Dock icon can reopen it. Other platforms quit for real.
+  if (process.platform !== "darwin") {
+    stopServer();
+    app.quit();
+  }
 });
 
 app.on("before-quit", () => stopServer());
 
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0 && serverProc) {
+let reopening = false;
+app.on("activate", async () => {
+  if (BrowserWindow.getAllWindows().length > 0 || reopening || !app.isReady()) return;
+  reopening = true;
+  try {
+    if (!serverProc || serverProc.exitCode !== null || serverProc.killed) await startServer();
     createWindow();
+  } catch (err) {
+    console.error("[luopian-electron] reopen failed", err);
+  } finally {
+    reopening = false;
   }
 });

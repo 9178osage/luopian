@@ -112,9 +112,8 @@ export function Studio() {
   const [url, setUrl] = useState("");
   const [preset, setPreset] = useState<PresetId>("best");
   const [playlistEnd, setPlaylistEnd] = useState<number | null>(null);
-  const [imageEnd, setImageEnd] = useState(40);
+  const [imageEnd, setImageEnd] = useState<number | null>(null);
   // The limit field still defaults to 40. That value means unlimited until the user edits it.
-  const [imageEndTouched, setImageEndTouched] = useState(false);
   const [cookies, setCookies] = useState("");
   const [pixivToken, setPixivToken] = useState("");
   const [formatId, setFormatId] = useState<string | null>(null);
@@ -142,7 +141,7 @@ export function Studio() {
         {
           preset,
           playlistEnd: isImagePreset(preset)
-            ? imageEndTouched
+            ? imageEnd != null
               ? clampImageEnd(imageEnd)
               : null
             : playlistEnd,
@@ -152,7 +151,7 @@ export function Studio() {
         },
         locale,
       ),
-    [cookies, formatId, imageEnd, imageEndTouched, locale, playlistEnd, preset, url, videoOnly],
+    [cookies, formatId, imageEnd, locale, playlistEnd, preset, url, videoOnly],
   );
 
   useEffect(() => {
@@ -308,7 +307,7 @@ export function Studio() {
           url,
           preset,
           playlistEnd: isImagePreset(preset)
-            ? imageEndTouched
+            ? imageEnd != null
               ? clampImageEnd(imageEnd)
               : null
             : preset === "playlist" && playlistEnd != null
@@ -523,15 +522,19 @@ export function Studio() {
               <input
                 type="number"
                 min={1}
-                max={lane === "image" ? 40 : 20}
-                placeholder={lane === "image" ? undefined : locale === "en" ? "all" : "全部"}
-                value={lane === "image" ? imageEnd : (playlistEnd ?? "")}
+                max={lane === "image" ? 200 : 20}
+                placeholder={locale === "en" ? "all" : "全部"}
+                value={lane === "image" ? (imageEnd ?? "") : (playlistEnd ?? "")}
                 onChange={(event) => {
                   const raw = event.target.value.trim();
                   if (lane === "image") {
+                    // Empty = every post (no --post-range), same as the CLI
+                    if (raw === "") {
+                      setImageEnd(null);
+                      return;
+                    }
                     const next = Number(raw);
                     if (!Number.isFinite(next)) return;
-                    setImageEndTouched(true);
                     setImageEnd(next);
                     return;
                   }
@@ -545,7 +548,7 @@ export function Studio() {
                   setPlaylistEnd(next);
                 }}
                 onBlur={() => {
-                  if (lane === "image") setImageEnd((value) => clampImageEnd(value));
+                  if (lane === "image") setImageEnd((value) => (value == null ? null : clampImageEnd(value)));
                   else setPlaylistEnd((value) => (value == null ? null : clampPlaylistEnd(value)));
                 }}
                 className="h-11 w-20 rounded-sm border border-line bg-bg px-3 text-right font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent/40"

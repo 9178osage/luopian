@@ -177,8 +177,8 @@ export function isBulkImagePreset(value: PresetId): boolean {
 }
 
 export function clampImageEnd(value: number): number {
-  if (!Number.isFinite(value)) return 40;
-  return Math.min(40, Math.max(1, Math.round(value)));
+  if (!Number.isFinite(value)) return 200;
+  return Math.min(200, Math.max(1, Math.round(value)));
 }
 
 export function imageHost(raw: string): "x" | "pixiv" | null {

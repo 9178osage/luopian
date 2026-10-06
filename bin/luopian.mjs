@@ -21,6 +21,7 @@ import {
   toArtistMediaUrl,
   intentArgs,
   imagePostRange,
+  imageHost,
   isImagePreset,
   isYoutube,
   validateUrl,
@@ -281,10 +282,9 @@ async function interactiveLoop(opts) {
         rl.close();
         return;
       }
-      let host = null;
-      try { host = new URL(text).hostname.toLowerCase().replace(/^www\./, ""); } catch { host = null; }
-      const isX = host === "x.com" || host === "twitter.com" || (host && host.endsWith(".twitter.com"));
-      const isPixiv = host === "pixiv.net" || (host && host.endsWith(".pixiv.net"));
+      const kind = imageHost(text);
+      const isX = kind === "x";
+      const isPixiv = kind === "pixiv";
       console.log(isPixiv ? copy.pixivMenu : isX ? copy.xMenu : copy.videoMenu);
       const choice = await askChoice(rl, isPixiv ? copy.choosePixiv : isX ? copy.chooseX : copy.chooseVideo);
       const next = { ...opts };
@@ -292,6 +292,8 @@ async function interactiveLoop(opts) {
         if (isPixiv) {
           const u = new URL(text);
           const parts = u.pathname.split("/").filter(Boolean);
+          // pixiv.net/en/users/123 → drop the language segment
+          if (parts[0] && /^[a-z]{2}(-[a-z]{2,4})?$/i.test(parts[0]) && parts[0] !== "users") parts.shift();
           const id = parts[1] || parts[0];
           if (choice === "1" || choice === "") {
             next.preset = "artwork";

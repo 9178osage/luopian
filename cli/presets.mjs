@@ -47,7 +47,7 @@ export function clampImageEnd(value) {
 export function imageHost(raw) {
   try {
     const host = new URL(raw).hostname.toLowerCase().replace(/^www\./, "");
-    if (host === "x.com" || host === "twitter.com" || host.endsWith(".twitter.com")) return "x";
+    if (host === "x.com" || host === "twitter.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com")) return "x";
     if (host === "pixiv.net" || host.endsWith(".pixiv.net")) return "pixiv";
   } catch {
     /* ignore */
