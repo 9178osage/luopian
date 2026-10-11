@@ -1,5 +1,9 @@
 # 落片 (Luopian)
 
+> **已停止维护，改用油猴脚本。** 这个仓库留作纪念，已设为只读存档。
+>
+> **No longer maintained** — replaced by a userscript. Kept as an archive.
+
 Paste a link to download, from the terminal or as a desktop app.
 
 落片是「粘贴链接就下载」：终端走 `luopian`，桌面窗口走同一套界面。两条路保存位置不同。
