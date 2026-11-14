@@ -1,32 +1,27 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-import { copy, parseLocale } from "@/lib/i18n";
-import { guardStudioMutation } from "@/lib/downloader/request-guard";
+import { parseLocale } from "@/lib/i18n";
+import { downloadMessages } from "@/lib/downloader/messages";
+import { guardStudioMutation, jobJson, JOB_ID } from "@/lib/downloader/request-guard";
 
-const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+async function jobResponse(request: Request, id: string, action: "status" | "cancel") {
+  const messages = downloadMessages(parseLocale(new URL(request.url).searchParams.get("lang")));
+  if (!JOB_ID.test(id)) return jobJson({ error: messages.missingJob }, 404);
+  const { getJob, cancelJob } = await import("@/lib/downloader/engine.server");
+  try {
+    const job = await (action === "status" ? getJob(id) : cancelJob(id));
+    return job ? jobJson(job) : jobJson({ error: messages.missingJob }, 404);
+  } catch {
+    return jobJson({ error: messages.storage }, 500);
+  }
+}
 
 export const Route = createFileRoute("/api/jobs/$jobId")({
   server: {
     handlers: {
-      GET: async ({ params, request }) => {
-        const phrases = copy(parseLocale(new URL(request.url).searchParams.get("lang")));
-        if (!ID.test(params.jobId)) return Response.json({ error: phrases.jobMissing }, { status: 404 });
-        const { getJob } = await import("@/lib/downloader/engine.server");
-        const job = getJob(params.jobId);
-        if (!job) return Response.json({ error: phrases.jobMissing }, { status: 404 });
-        return Response.json(job);
-      },
-      DELETE: async ({ params, request }) => {
-        // Cancel: no JSON body, but still reject cross-origin when Origin is present.
-        const guarded = guardStudioMutation(request, { requireJsonBody: false });
-        if (guarded) return guarded;
-        const phrases = copy(parseLocale(new URL(request.url).searchParams.get("lang")));
-        if (!ID.test(params.jobId)) return Response.json({ error: phrases.jobMissing }, { status: 404 });
-        const { cancelJob } = await import("@/lib/downloader/engine.server");
-        const job = cancelJob(params.jobId);
-        if (!job) return Response.json({ error: phrases.jobMissing }, { status: 404 });
-        return Response.json(job);
-      },
+      GET: async ({ params, request }) => jobResponse(request, params.jobId, "status"),
+      DELETE: async ({ params, request }) =>
+        guardStudioMutation(request, false) ?? jobResponse(request, params.jobId, "cancel"),
     },
   },
 });

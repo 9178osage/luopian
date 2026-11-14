@@ -19,8 +19,12 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    const stored = localStorage.getItem(KEY);
-    if (stored === "en" || stored === "zh") setLocale(stored);
+    try {
+      const stored = localStorage.getItem(KEY);
+      if (stored === "en" || stored === "zh") setLocale(stored);
+    } catch {
+      // The default locale still works when storage is unavailable.
+    }
     setReady(true);
   }, []);
 
@@ -28,12 +32,17 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     if (!ready) return;
     document.documentElement.lang = locale === "en" ? "en" : "zh-Hans";
     document.title = copy(locale).title;
-    localStorage.setItem(KEY, locale);
+    try {
+      localStorage.setItem(KEY, locale);
+    } catch {
+      // A storage error should not affect the current language.
+    }
   }, [locale, ready]);
 
   return <LocaleContext.Provider value={{ locale, setLocale }}>{children}</LocaleContext.Provider>;
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- Hook shares the provider's context.
 export function useLocale() {
   return useContext(LocaleContext);
 }

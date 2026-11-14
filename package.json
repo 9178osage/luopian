@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node scripts/with-app-env.mjs vite dev --host 0.0.0.0 --port 8080",
     "build": "node scripts/with-app-env.mjs vite build && npm run db:migrate",
+    "build:desktop": "node scripts/with-app-env.mjs vite build --mode desktop",
     "db:migrate": "node scripts/migrate.mjs",
     "build:dev": "node scripts/with-app-env.mjs vite build --mode development",
     "preview": "node scripts/with-app-env.mjs vite preview",
@@ -16,17 +17,17 @@
     "preview:stop": "node scripts/preview.mjs stop",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts",
+    "test": "node --experimental-strip-types --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "electron:dev": "electron .",
+    "electron:dev": "npm run build:desktop && electron .",
     "electron:start": "electron .",
     "mac:tools": "sh scripts/mac-setup-tools.sh",
-    "dist:mac": "electron-builder --mac dmg dir",
+    "dist:mac": "npm run build:desktop && electron-builder --mac dmg dir",
     "cli": "node bin/luopian.mjs",
     "cli:doctor": "node bin/luopian.mjs doctor",
     "cli:link": "npm link",
-    "dist:win": "electron-builder --win nsis --x64"
+    "dist:win": "npm run build:desktop && electron-builder --win nsis --x64"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
@@ -105,30 +106,27 @@
     "electron-builder": "^26.0.12"
   },
   "productName": "落片",
-  "description": "落片 — paste a link to download, from the terminal or as a desktop app",
+  "description": "落片 — download individual YouTube videos from the terminal or desktop",
   "main": "electron/main.mjs",
   "build": {
     "appId": "com.luopian.app",
     "productName": "落片",
     "copyright": "Copyright © Luopian",
     "directories": {
+      "app": "electron",
       "output": "release"
     },
-    "asar": false,
-    "afterPack": "./scripts/after-pack-vendor.cjs",
+    "beforeBuild": "./scripts/desktop-before-build.cjs",
     "files": [
-      "electron/**/*",
-      "scripts/**/*",
-      "src/**/*",
-      "server/**/*",
-      "public/**/*",
-      "migrations/**/*",
-      "package.json",
-      "package-lock.json",
-      "vite.config.ts",
-      "tsconfig.json",
-      "vercel.json",
-      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+      "*.mjs",
+      "*.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/desktop",
+        "to": "luopian"
+      }
     ],
     "mac": {
       "category": "public.app-category.utilities",

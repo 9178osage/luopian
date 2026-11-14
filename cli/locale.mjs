@@ -29,7 +29,7 @@ export function normalizeLang(value) {
     .replace(/['"]/g, "");
   if (!text) return null;
   const head = text.split(/[\s.@]/)[0];
-  if (head === "en" || head.startsWith("en_") || head === "english") return "en";
+  if (head === "en" || head.startsWith("en_") || head.startsWith("en-") || head === "english") return "en";
   if (head === "zh" || head.startsWith("zh_") || head.startsWith("zh-") || head === "chinese") return "zh";
   return null;
 }

@@ -1,422 +1,222 @@
 #!/usr/bin/env node
-/**
- * 落片 CLI — paste/pass a URL, download via yt-dlp or gallery-dl.
- *
- * Usage:
- *   luopian <url>
- *   luopian -p mp3 <url>
- *   luopian --preset playlist --end 5 <url>
- *   luopian -o ~/Movies <url>
- *   echo <url> | luopian
- *   luopian doctor
- */
-import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { constants, tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
-import {
-  ALL_PRESETS,
-  inferPreset,
-  toArtistMediaUrl,
-  intentArgs,
-  imagePostRange,
-  imageHost,
-  isImagePreset,
-  isYoutube,
-  validateUrl,
-} from "../cli/presets.mjs";
-import { brewPathEnv, resolveTools } from "../cli/tools.mjs";
+import { parseArgs, promisify } from "node:util";
+
 import { detectLang, normalizeLang, saveLang } from "../cli/locale.mjs";
 import { messages } from "../cli/messages.mjs";
+import { brewPathEnv, resolveTools } from "../cli/tools.mjs";
+import { isQuality, normalizeYouTubeUrl, VIDEO_FILENAME, youtubeArgs } from "../shared/youtube.mjs";
 
-function t() {
-  return messages(detectLang().lang);
-}
+const copy = messages(detectLang().lang);
+const exec = promisify(execFile);
 
-function langVia(copy, detected) {
-  if (detected.source === "LUOPIAN_LANG") return copy.viaEnv;
-  if (detected.source === "default") return copy.viaDefault;
-  if (detected.source === "LANG" || detected.source === "LC_ALL") return copy.viaLocale(detected.source);
-  return copy.viaFile(detected.source);
-}
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function printHelp() {
-  console.log(t().help);
-}
-
-function parseArgs(argv) {
-  const opts = {
-    preset: null,
-    out: null,
-    template: null,
-    end: null,
-    format: null,
-    videoOnly: false,
-    cookies: null,
-    browser: null,
-    filter: null,
-    impersonate: null,
-    url: null,
-    doctor: false,
-    help: false,
-    version: false,
-    listFormats: false,
-    setLang: false,
-    lang: "",
-  };
-  const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "-h" || a === "--help") opts.help = true;
-    else if (a === "-v" || a === "--version") opts.version = true;
-    else if (a === "-F" || a === "--list-formats") opts.listFormats = true;
-    else if (a === "doctor") opts.doctor = true;
-    else if (a === "-p" || a === "--preset") opts.preset = argv[++i];
-    else if (a === "-o" || a === "--out") {
-      const v = argv[++i];
-      if (v && v.includes("%")) opts.template = v;
-      else opts.out = v;
-    }
-    else if (a === "-e" || a === "--end") opts.end = Number(argv[++i]);
-    else if (a === "-f" || a === "--format") opts.format = argv[++i];
-    else if (a === "--video-only") opts.videoOnly = true;
-    else if (a === "--cookies") opts.cookies = argv[++i];
-    else if (a === "--cookies-from-browser") opts.browser = argv[++i] || "chrome";
-    else if (a === "--filter") opts.filter = argv[++i];
-    else if (a === "--impersonate") opts.impersonate = argv[++i] || "chrome";
-    else if (a.startsWith("-")) {
-      console.error(t().unknownOption(a));
-      process.exit(2);
-    } else rest.push(a);
+class CliError extends Error {
+  constructor(message, exitCode = 1) {
+    super(message);
+    this.exitCode = exitCode;
   }
-  if (rest[0] === "lang") {
-    opts.lang = rest[1] ?? "";
-    opts.setLang = true;
-  } else if (rest[0] && rest[0] !== "doctor") opts.url = rest[0];
-  return opts;
+}
+
+function parseOptions() {
+  try {
+    return parseArgs({
+      allowPositionals: true,
+      options: {
+        quality: { type: "string", short: "q" },
+        preset: { type: "string", short: "p" },
+        out: { type: "string", short: "o" },
+        help: { type: "boolean", short: "h" },
+        version: { type: "boolean", short: "v" },
+      },
+    });
+  } catch (error) {
+    throw new CliError(error.message, 2);
+  }
 }
 
 async function readStdinUrl() {
-  if (process.stdin.isTTY) return null;
-  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  let text = "";
-  for await (const line of rl) {
-    text += line.trim();
-    if (text) break;
+  const terminal = process.stdin.isTTY;
+  const reader = createInterface({
+    input: process.stdin,
+    output: terminal ? process.stdout : undefined,
+    crlfDelay: Infinity,
+  });
+  reader.setPrompt(copy.prompt);
+  if (terminal) reader.prompt();
+  try {
+    for await (const line of reader) {
+      const url = line.trim();
+      if (url) return url;
+      if (terminal) reader.prompt();
+    }
+  } finally {
+    reader.close();
   }
-  return text || null;
+  return null;
 }
 
-function run(bin, args, env) {
-  return new Promise((resolve, reject) => {
-    const copy = t();
-    console.error(`${copy.prefix} ${bin} ${args.map((x) => (/\s/.test(x) ? JSON.stringify(x) : x)).join(" ")}`);
-    const child = spawn(bin, args, {
-      env,
-      stdio: "inherit",
-      windowsHide: true,
-    });
-    child.on("error", (err) => {
-      if (err && err.code === "ENOENT") {
-        reject(new Error(`${t().toolMissing(bin)} ${t().toolInstall()}`));
-        return;
-      }
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(t().exitCode(code)));
-    });
-  });
+async function readToolVersion(bin, args, env) {
+  const result = await exec(bin, args, { env, timeout: 8000, windowsHide: true, maxBuffer: 65536 });
+  return result.stdout.trim().split(/\r?\n/, 1)[0] || result.stderr.trim().split(/\r?\n/, 1)[0];
 }
 
 async function doctor() {
   const tools = resolveTools();
-  const copy = t();
-  const title = process.platform === "win32" ? copy.doctorTitleWin : copy.doctorTitle;
-  console.log(`${title}\n`);
-  for (const [k, v] of Object.entries(tools)) {
-    const shown = v == null || v === "" ? "(not found)" : v;
-    console.log(`  ${k.padEnd(10)} ${shown}`);
-  }
-  console.log("");
-  let missing = false;
-  for (const [name, bin, args] of [
-    ["yt-dlp", tools.ytdlp, ["--version"]],
-    ["gallery-dl", tools.gallery, ["--version"]],
-    ["ffmpeg", tools.ffmpeg, ["-version"]],
-  ]) {
-    try {
-      await new Promise((resolve, reject) => {
-        const child = spawn(bin, args, { env: brewPathEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-        let out = "";
-        child.stdout.on("data", (d) => (out += d));
-        child.stderr.on("data", (d) => (out += d));
-        child.on("error", reject);
-        child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(out || String(code)))));
-      }).then((out) => {
-        const line = String(out).split("\n")[0].trim();
-        console.log(`  ✓ ${name}: ${line}`);
-      });
-    } catch (err) {
-      missing = true;
-      const detail = err && err.code === "ENOENT" ? copy.toolMissing(name) : err.message?.slice(0, 120) || err;
-      console.log(`  ✗ ${name}: ${detail}`);
-    }
-  }
-  console.log(`\n${copy.cliEntry(path.resolve(__dirname, "luopian.mjs"))}`);
-  if (process.platform === "win32") {
-    console.log(copy.installWinNode);
-    console.log(copy.installWinNpm);
-  } else {
-    console.log(copy.installNpm);
-    console.log(copy.installLn);
-  }
-  if (missing) console.log(copy.toolInstall());
-}
-
-async function listFormatsFor(urlRaw) {
-  const url = validateUrl(urlRaw);
-  const tools = resolveTools();
-  const args = ["-F", url];
-  if (isYoutube(url)) {
-    args.unshift("youtube:player_client=android,web");
-    args.unshift("--extractor-args");
-    args.unshift("-4");
-  }
-  await run(tools.ytdlp, args, brewPathEnv());
-}
-
-async function downloadOne(opts, urlRaw) {
-  if (opts.listFormats) {
-    await listFormatsFor(urlRaw);
-    return;
-  }
-  const url = validateUrl(urlRaw);
-  const preset = opts.preset || inferPreset(url);
-  if (!ALL_PRESETS.includes(preset)) {
-    throw new Error(t().unknownPreset(preset, ALL_PRESETS.join(", ")));
-  }
-
-  const tools = resolveTools();
-  const outDir = opts.out || tools.outDir;
-  mkdirSync(outDir, { recursive: true });
   const env = brewPathEnv();
-
-  if (isImagePreset(preset)) {
-    const args = ["--no-colors", "--dest", outDir, "--retries", "3"];
-    if (!opts.browser) args.push("--no-input");
-    if (opts.end != null) {
-      const range = imagePostRange(preset, url, opts.end);
-      if (range) args.push("--post-range", range);
-    }
-    if (opts.cookies) args.push("--cookies", opts.cookies);
-    if (opts.browser) args.push("--cookies-from-browser", opts.browser);
-    if (opts.filter) args.push("--filter", opts.filter);
-    else if (preset === "illustrations") args.push("--filter", "type == 'illust'");
-    args.push(url);
-    await run(tools.gallery, args, env);
-  } else {
-    const args = [
-      "--no-colors",
-      "--ffmpeg-location",
-      tools.ffmpeg,
-      "--newline",
-      "--no-mtime",
-      "--retries",
-      "3",
-      "--fragment-retries",
-      "3",
-      "-P",
-      outDir,
-      "-o",
-      opts.template || "%(title)s.%(ext)s",
-      "--merge-output-format",
-      "mp4",
-      ...intentArgs({
-        preset,
-        playlistEnd: opts.end ?? null,
-        formatId: opts.format,
-        videoOnly: opts.videoOnly,
-      }),
-    ];
-    if (isYoutube(url)) {
-      if (tools.nodeBin) {
-        args.push("--js-runtimes", `node:${tools.nodeBin}`, "--remote-components", "ejs:github");
-      } else {
-        args.push("--remote-components", "ejs:github");
-      }
-      args.push("-4", "--extractor-args", "youtube:player_client=android,web");
-      if (opts.impersonate) args.push("--impersonate", opts.impersonate);
-    }
-    if (opts.cookies) args.push("--cookies", opts.cookies);
-    if (preset === "playlist") args.push("--ignore-errors");
-    args.push(url);
-    await run(tools.ytdlp, args, env);
+  const checks = [
+    ["yt-dlp", tools.ytdlp, ["--ignore-config", "--no-plugin-dirs", "--version"]],
+    ["ffmpeg", tools.ffmpeg, ["-version"]],
+  ];
+  const results = await Promise.allSettled(
+    checks.map(([, bin, args]) => readToolVersion(bin, args, env)),
+  );
+  console.log(copy.doctorTitle);
+  results.forEach((result, index) => {
+    const [name, bin] = checks[index];
+    if (result.status === "fulfilled") console.log(`  ✓ ${name} · ${result.value} · ${bin}`);
+    else console.error(`  ✗ ${copy.toolMissing(name)} (${bin})`);
+  });
+  if (results.some((result) => result.status === "rejected")) {
+    console.error(copy.toolInstall);
+    process.exitCode = 1;
   }
-
-  console.error(`${t().prefix} ${t().done(outDir)}`);
 }
 
-async function askChoice(rl, question) {
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => resolve(String(answer || "").trim()));
+function runDownload(bin, args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      env,
+      stdio: ["ignore", "inherit", "inherit"],
+      windowsHide: true,
+    });
+    let stopping;
+    const stop = (signal) => {
+      stopping = signal;
+      child.kill(signal);
+    };
+    const interrupt = () => stop("SIGINT");
+    const terminate = () => stop("SIGTERM");
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", terminate);
+    child.once("error", (error) => {
+      reject(
+        error.code === "ENOENT"
+          ? new CliError(`${copy.toolMissing("yt-dlp")} ${copy.toolInstall}`)
+          : error,
+      );
+    });
+    child.once("close", (code, signal) => {
+      process.off("SIGINT", interrupt);
+      process.off("SIGTERM", terminate);
+      const stoppedBy = stopping ?? signal;
+      if (stoppedBy) {
+        reject(new CliError(copy.exitSignal(stoppedBy), 128 + (constants.signals[stoppedBy] ?? 0)));
+      } else if (code === 0) {
+        resolve();
+      } else {
+        reject(new CliError(copy.exitCode(code)));
+      }
+    });
   });
 }
 
-async function interactiveLoop(opts) {
-  const copy = t();
-  const tools = resolveTools();
-  const outDir = opts.out || tools.outDir;
-  console.log(copy.started);
-  console.log(`${copy.savingTo(outDir)}\n`);
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const promptUrl = () =>
-    askChoice(rl, copy.prompt).then(async (text) => {
-      if (!text) return promptUrl();
-      if (/^(q|quit|exit|退出)$/i.test(text)) {
-        console.log(copy.bye);
-        rl.close();
-        return;
-      }
-      const kind = imageHost(text);
-      const isX = kind === "x";
-      const isPixiv = kind === "pixiv";
-      console.log(isPixiv ? copy.pixivMenu : isX ? copy.xMenu : copy.videoMenu);
-      const choice = await askChoice(rl, isPixiv ? copy.choosePixiv : isX ? copy.chooseX : copy.chooseVideo);
-      const next = { ...opts };
-      try {
-        if (isPixiv) {
-          const u = new URL(text);
-          const parts = u.pathname.split("/").filter(Boolean);
-          // pixiv.net/en/users/123 → drop the language segment
-          if (parts[0] && /^[a-z]{2}(-[a-z]{2,4})?$/i.test(parts[0]) && parts[0] !== "users") parts.shift();
-          const id = parts[1] || parts[0];
-          if (choice === "1" || choice === "") {
-            next.preset = "artwork";
-            await downloadOne(next, text);
-          } else if (choice === "2") {
-            next.preset = "author";
-            const userUrl = parts[0] === "users" ? `${u.origin}/users/${id}` : text;
-            await downloadOne(next, userUrl);
-          } else if (choice === "3") {
-            next.preset = "illustrations";
-            next.filter = "type == 'illust'";
-            const userUrl = parts[0] === "users" ? `${u.origin}/users/${id}` : text;
-            await downloadOne(next, userUrl);
-          } else if (choice === "4") {
-            next.preset = "bookmarks";
-            let mark = text;
-            if (parts[0] === "users" && parts[1] && !text.includes("/bookmarks")) {
-              mark = `${u.origin}/users/${parts[1]}/bookmarks/artworks`;
-            }
-            await downloadOne(next, mark);
-          } else {
-            console.error(copy.badPixiv);
-          }
-        } else if (isX) {
-          if (choice === "1" || choice === "") {
-            next.preset = "tweet";
-            await downloadOne(next, text);
-          } else if (choice === "2") {
-            next.preset = "tweet";
-            next.browser = next.browser || "chrome";
-            await downloadOne(next, text);
-          } else if (choice === "3") {
-            next.preset = "media";
-            next.browser = next.browser || "chrome";
-            await downloadOne(next, toArtistMediaUrl(text));
-          } else {
-            console.error(copy.badX);
-          }
-        } else if (choice === "1" || choice === "") {
-          next.preset = "best";
-          await downloadOne(next, text);
-        } else if (choice === "2") {
-          next.preset = "hd1080";
-          await downloadOne(next, text);
-        } else if (choice === "3") {
-          next.preset = "mp3";
-          await downloadOne(next, text);
-        } else if (choice === "4") {
-          next.listFormats = true;
-          await downloadOne(next, text);
-        } else if (choice === "5") {
-          next.preset = "playlist";
-          await downloadOne(next, text);
-        } else {
-          console.error(copy.badVideo);
-        }
-      } catch (err) {
-        console.error(`${copy.prefix} ${err.message || err}`);
-      }
-      return promptUrl();
-    });
-  await promptUrl();
+async function completedFile(record, outDir) {
+  try {
+    const lines = (await readFile(record, "utf8")).trim().split(/\r?\n/);
+    if (lines.length !== 1) throw new CliError(copy.noFile);
+    const file = await realpath(JSON.parse(lines[0]));
+    if (path.dirname(file) !== (await realpath(outDir))) throw new CliError(copy.noFile);
+    const result = await stat(file);
+    if (result.isFile() && result.size > 0) return file;
+  } catch {
+    // No single, usable file was reported by the downloader.
+  }
+  throw new CliError(copy.noFile);
 }
 
-function handleLang(value) {
-  const detected = detectLang();
-  const copy = messages(detected.lang);
-  if (!String(value || "").trim()) {
-    console.log(copy.langNow(copy.langName, langVia(copy, detected)));
-    console.log(copy.langUsage);
-    return;
+async function download(url, quality, out) {
+  const tools = resolveTools();
+  const env = brewPathEnv();
+  const outDir = path.resolve(out || tools.outDir);
+  try {
+    await readToolVersion(tools.ffmpeg, ["-version"], env);
+  } catch {
+    throw new CliError(`${copy.toolMissing("ffmpeg")} ${copy.toolInstall}`);
   }
-  const next = normalizeLang(value);
-  if (!next) {
-    console.error(copy.badLang);
-    console.error(copy.langUsage);
-    process.exit(2);
+  await mkdir(outDir, { recursive: true });
+
+  const temp = await mkdtemp(path.join(tmpdir(), "luopian-cli-"));
+  const record = path.join(temp, "result");
+  // Keep attempts at different quality settings from reusing the same file.
+  const filename =
+    quality === "hd1080" ? VIDEO_FILENAME.replace(".%(ext)s", " [1080p].%(ext)s") : VIDEO_FILENAME;
+  try {
+    await runDownload(
+      tools.ytdlp,
+      [
+        ...youtubeArgs({ quality, ffmpeg: tools.ffmpeg, nodeBin: tools.nodeBin }),
+        "--paths",
+        outDir,
+        "--output",
+        filename,
+        "--print-to-file",
+        "after_move:%(filepath)j",
+        record.replaceAll("%", "%%"),
+        "--",
+        url,
+      ],
+      env,
+    );
+    const file = await completedFile(record, outDir);
+    console.log(copy.done(file));
+  } finally {
+    await rm(temp, { recursive: true, force: true }).catch(() => undefined);
   }
-  const saved = saveLang(next);
-  const savedCopy = messages(next);
-  console.log(savedCopy.langSaved(savedCopy.langName));
-  console.log(savedCopy.langFiles);
-  for (const file of saved.files) console.log(`  ${file}`);
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  if (opts.setLang) {
-    handleLang(opts.lang);
+  const { values, positionals } = parseOptions();
+  if (values.help) {
+    console.log(copy.help);
     return;
   }
-  if (opts.help) {
-    printHelp();
-    return;
-  }
-  if (opts.version) {
-    console.log(t().version);
-    return;
-  }
-  if (opts.doctor) {
-    await doctor();
+  if (values.version) {
+    const manifest = JSON.parse(
+      await readFile(new URL("../package.json", import.meta.url), "utf8"),
+    );
+    console.log(manifest.version);
     return;
   }
 
-  let urlRaw = opts.url || (await readStdinUrl());
-  if (!urlRaw) {
-    if (process.stdin.isTTY && !opts.listFormats) {
-      await interactiveLoop(opts);
-      return;
+  const [command, language, ...rest] = positionals;
+  if (command === "doctor" || command === "lang") {
+    if (Object.keys(values).length || rest.length || (command === "doctor" && language)) {
+      throw new CliError(copy.extraCommandArgs, 2);
     }
-    printHelp();
-    process.exit(1);
-  }
-
-  if (opts.listFormats) {
-    await listFormatsFor(urlRaw);
+    if (command === "doctor") return doctor();
+    if (!language) return console.log(`${copy.langNow}\n${copy.langUsage}`);
+    const next = normalizeLang(language);
+    if (!next) throw new CliError(copy.badLang, 2);
+    saveLang(next);
+    console.log(messages(next).langSaved);
     return;
   }
 
-  await downloadOne(opts, urlRaw);
+  if (positionals.length > 1) throw new CliError(copy.tooManyArgs, 2);
+  const resolution = values.quality ?? values.preset ?? "best";
+  const quality = resolution === "1080" ? "hd1080" : resolution;
+  if (!isQuality(quality)) throw new CliError(copy.invalidQuality, 2);
+  const raw = command ?? (await readStdinUrl());
+  const url = raw && normalizeYouTubeUrl(raw);
+  if (!url) throw new CliError(copy.invalidUrl, 2);
+  await download(url, quality, values.out);
 }
 
-main().catch((err) => {
-  console.error(`${t().prefix} ${err.message || err}`);
-  process.exit(1);
+main().catch((error) => {
+  console.error(error.message || String(error));
+  process.exitCode = error instanceof CliError ? error.exitCode : 1;
 });

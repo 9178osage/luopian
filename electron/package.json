@@ -1,0 +1,9 @@
+{
+  "name": "luopian",
+  "private": true,
+  "version": "1.0.0",
+  "description": "落片 — YouTube video downloader",
+  "author": "Luopian",
+  "type": "module",
+  "main": "main.mjs"
+}

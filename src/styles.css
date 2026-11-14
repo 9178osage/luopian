@@ -1,20 +1,19 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "IBM Plex Sans", "PingFang SC", "Noto Sans SC", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
 
-  --color-bg: #0e0f11;
-  --color-elev: #16181c;
-  --color-subtle: #1e2126;
-  --color-fg: #ececef;
-  --color-muted: #a1a5ae;
-  --color-faint: #6e737d;
-  --color-line: #2a2e35;
-  --color-line-strong: #3c424c;
-  --color-accent: #e4e7ec;
-  --color-accent-fg: #121316;
-  --color-danger: #e0a8a4;
+  --color-bg: #11131a;
+  --color-elev: #191c26;
+  --color-subtle: #262a37;
+  --color-fg: #f1f2f8;
+  --color-muted: #afb3c3;
+  --color-faint: #8b91a8;
+  --color-line: #303547;
+  --color-line-strong: #49516a;
+  --color-accent: #bcc7ff;
+  --color-accent-fg: #181f43;
+  --color-danger: #ffafad;
 
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
@@ -38,17 +37,8 @@
   }
 
   button:not(:disabled),
-  [role="button"]:not(:disabled),
-  summary {
+  [role="button"]:not(:disabled) {
     cursor: pointer;
-  }
-
-  summary {
-    list-style: none;
-  }
-
-  summary::-webkit-details-marker {
-    display: none;
   }
 
   ::selection {

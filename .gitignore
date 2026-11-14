@@ -13,6 +13,7 @@ dist/
 .vite/
 preview-dist/
 coverage/
+screenshots/
 out/
 .cache/
 Thumbs.db

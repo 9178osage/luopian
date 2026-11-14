@@ -13,8 +13,12 @@ function errorMessage(error: unknown, fallback: string): string {
 export function AppErrorComponent({ error }: ErrorComponentProps) {
   const [locale, setLocale] = useState<Locale>("zh");
   useEffect(() => {
-    const stored = localStorage.getItem("luopian.lang");
-    if (stored === "en" || stored === "zh") setLocale(stored);
+    try {
+      const stored = localStorage.getItem("luopian.lang");
+      if (stored === "en" || stored === "zh") setLocale(stored);
+    } catch {
+      // The error page can render with the default locale.
+    }
   }, []);
   const phrases = copy(locale);
   return (
@@ -23,7 +27,9 @@ export function AppErrorComponent({ error }: ErrorComponentProps) {
         <TriangleAlert className="size-10" strokeWidth={1.75} />
       </span>
       <h1 className="text-lg font-medium">{phrases.pageBroke}</h1>
-      <p className="max-w-md text-sm break-words text-muted">{errorMessage(error, phrases.pageRetry)}</p>
+      <p className="max-w-md text-sm break-words text-muted">
+        {errorMessage(error, phrases.pageRetry)}
+      </p>
     </main>
   );
 }
