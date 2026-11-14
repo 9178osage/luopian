@@ -86,17 +86,50 @@ async function doctor() {
   }
 }
 
-function runDownload(bin, args, env) {
+const windows = process.platform === "win32";
+
+function stopProcessTree(child, signal) {
+  if (!child.pid) return;
+  const stopChild = () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  if (windows) {
+    const task = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    task.once("error", stopChild);
+    task.once("exit", (code) => {
+      if (code !== 0) stopChild();
+    });
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    stopChild();
+  }
+}
+
+function runDownload(bin, args, env, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
+      cwd,
       env,
       stdio: ["ignore", "inherit", "inherit"],
+      detached: !windows,
       windowsHide: true,
     });
     let stopping;
+    let killTimer;
     const stop = (signal) => {
+      if (stopping) return;
       stopping = signal;
-      child.kill(signal);
+      stopProcessTree(child, signal);
+      if (!windows) {
+        killTimer = setTimeout(() => stopProcessTree(child, "SIGKILL"), 1200);
+        killTimer.unref();
+      }
     };
     const interrupt = () => stop("SIGINT");
     const terminate = () => stop("SIGTERM");
@@ -112,6 +145,11 @@ function runDownload(bin, args, env) {
     child.once("close", (code, signal) => {
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", terminate);
+      if (killTimer) {
+        clearTimeout(killTimer);
+        // The downloader can exit before its subprocesses do.
+        stopProcessTree(child, "SIGKILL");
+      }
       const stoppedBy = stopping ?? signal;
       if (stoppedBy) {
         reject(new CliError(copy.exitSignal(stoppedBy), 128 + (constants.signals[stoppedBy] ?? 0)));
@@ -128,7 +166,7 @@ async function completedFile(record, outDir) {
   try {
     const lines = (await readFile(record, "utf8")).trim().split(/\r?\n/);
     if (lines.length !== 1) throw new CliError(copy.noFile);
-    const file = await realpath(JSON.parse(lines[0]));
+    const file = await realpath(path.resolve(outDir, JSON.parse(lines[0])));
     if (path.dirname(file) !== (await realpath(outDir))) throw new CliError(copy.noFile);
     const result = await stat(file);
     if (result.isFile() && result.size > 0) return file;
@@ -159,8 +197,6 @@ async function download(url, quality, out) {
       tools.ytdlp,
       [
         ...youtubeArgs({ quality, ffmpeg: tools.ffmpeg, nodeBin: tools.nodeBin }),
-        "--paths",
-        outDir,
         "--output",
         filename,
         "--print-to-file",
@@ -170,6 +206,7 @@ async function download(url, quality, out) {
         url,
       ],
       env,
+      outDir,
     );
     const file = await completedFile(record, outDir);
     console.log(copy.done(file));

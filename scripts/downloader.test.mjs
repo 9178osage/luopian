@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -17,6 +19,11 @@ const good = "AbCdEf01234";
 const failure = "Fail0123456";
 const ambiguous = "Ambi0123456";
 const hanging = "Wait0123456";
+const largeVideo = "Large012345";
+const diskError = "Disk0123456";
+const largeBytes = 2 * 1024 ** 3 + 1;
+const ampleDisk = { bavail: 1_000_000n, bsize: 4096n };
+const lowDisk = { bavail: 100_000n, bsize: 4096n };
 const video = (id) => `https://www.youtube.com/watch?v=${id}`;
 const input = (id) => ({ url: video(id), quality: "best", lang: "en" });
 const jobManifest = ".luopian-job.json";
@@ -28,7 +35,7 @@ let unknownDirs;
 let expired;
 
 const fixture = `#!/usr/bin/env node
-import { writeFile } from "node:fs/promises";
+import { truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 const args = process.argv.slice(2);
 if (args.length === 1) {
@@ -47,8 +54,14 @@ if (id === "${hanging}") {
   process.on("SIGTERM", () => setTimeout(() => process.exit(1), 180));
   console.log("luopian-progress:42%|4 MiB/s|00:01");
   setInterval(() => {}, 1000);
+} else if (id === "${diskError}") {
+  await writeFile(output + ".part", "partial");
+  console.error("Error writing trailer: No space left on device");
+  console.error("ERROR: Postprocessing failed");
+  process.exitCode = 1;
 } else {
   await writeFile(output, "synthetic video");
+  if (id === "${largeVideo}") await truncate(output, ${largeBytes});
   console.log("luopian-progress:55%|3 MiB/s|00:01");
   console.log("luopian-file:" + JSON.stringify(output));
   if (id === "${failure}") {
@@ -125,6 +138,16 @@ function portable(testName, fn) {
   test(testName, { skip: windows ? "uses an executable Node fixture on Unix" : false }, fn);
 }
 
+function mockDisk(t, check) {
+  const mocked = t.mock.method(fs, "statfs", check);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  });
+  return mocked;
+}
+
 async function waitFor(job, predicate) {
   const until = Date.now() + 5000;
   for (;;) {
@@ -153,6 +176,52 @@ portable("server holds a single download slot through startup and cancellation",
   await assert.rejects(engine.startJob(input(good)), { status: 409 });
   await waitFor(job, (item) => item.status === "canceled");
   assert.equal((await engine.openJobFile(job.id)).status, 404);
+});
+
+portable(
+  "desktop checks its staging volume for free space before starting a download",
+  async (t) => {
+    const entries = (await fs.readdir(root)).sort();
+    const check = mockDisk(t, async () => lowDisk);
+    await assert.rejects(engine.startJob(input(good)), {
+      status: 507,
+      message: /low on free space/,
+    });
+    assert.equal(check.mock.callCount(), 1);
+    assert.equal(path.basename(check.mock.calls[0].arguments[0]), "files");
+    assert.deepEqual((await fs.readdir(root)).sort(), entries);
+  },
+);
+
+portable("desktop stops and clears a download when free space drops", async (t) => {
+  const volumes = [ampleDisk, lowDisk];
+  mockDisk(t, async () => volumes.shift() ?? lowDisk);
+  const job = await engine.startJob(input(hanging));
+  await waitFor(job, (item) => item.percent === 42);
+  const failed = await waitFor(job, (item) => item.status === "error");
+  assert.match(failed.error, /low on free space/);
+  await assert.rejects(access(path.join(root, job.id, "files")), { code: "ENOENT" });
+  assert.equal((await engine.openJobFile(job.id)).status, 404);
+});
+
+portable("a desktop file over 2 GiB can be saved when the volume has free space", async (t) => {
+  mockDisk(t, async () => ampleDisk);
+  const job = await engine.startJob(input(largeVideo));
+  const completed = await waitFor(job, (item) => item.status !== "running");
+  assert.equal(completed.status, "done");
+  assert.equal(completed.bytes, largeBytes);
+  const response = await engine.openJobFile(job.id);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-length"), String(largeBytes));
+  await response.body.cancel();
+});
+
+portable("desktop preserves the disk write error when postprocessing also fails", async (t) => {
+  mockDisk(t, async () => ampleDisk);
+  const job = await engine.startJob(input(diskError));
+  const failed = await waitFor(job, (item) => item.status === "error");
+  assert.match(failed.error, /low on free space/);
+  await assert.rejects(access(path.join(root, job.id, "files")), { code: "ENOENT" });
 });
 
 portable("an unsuccessful downloader exit never publishes a leftover file", async () => {

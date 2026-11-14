@@ -1,7 +1,17 @@
 import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  statfs,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -20,6 +30,7 @@ import { JOB_ID, jobJson } from "./request-guard.ts";
 import type { EngineInfo, JobView } from "./types.ts";
 
 const windows = process.platform === "win32";
+const desktop = process.env.LUOPIAN_DESKTOP === "1";
 const home = os.homedir();
 const root = path.resolve(
   process.env.LUOPIAN_ROOT ||
@@ -34,14 +45,15 @@ const root = path.resolve(
         : path.join(os.tmpdir(), "luopian")),
 );
 const manifest = ".luopian-job.json";
-const maxBytes = 2 * 1024 ** 3;
+const minimumFreeBytes = 512n * 1024n ** 2n;
+const previewMaxBytes = 2 * 1024 ** 3;
 const keepFor = 3 * 60 * 60 * 1000;
 const keepCount = 8;
 const outputPrefix = "luopian-file:";
 const progressPrefix = "luopian-progress:";
 const exec = promisify(execFile);
 
-type StopReason = "cancel" | "timeout" | "size" | "shutdown";
+type StopReason = "cancel" | "space" | "timeout" | "size" | "shutdown";
 
 type SavedJob = {
   schema: 1;
@@ -60,6 +72,7 @@ type Job = SavedJob & {
   killTimer: NodeJS.Timeout | null;
   outputs: string[];
   toolError: string | null;
+  diskWriteFailed: boolean;
 };
 
 type Store = {
@@ -115,6 +128,7 @@ function createJob(saved: SavedJob, dir: string): Job {
     killTimer: null,
     outputs: [],
     toolError: null,
+    diskWriteFailed: false,
   };
 }
 
@@ -428,11 +442,17 @@ function recordLine(job: Job, line: string, stdout: boolean) {
     };
     return;
   }
-  if (/^ERROR:/i.test(line.trimStart())) {
-    job.toolError = stripVTControlCharacters(line)
-      .trim()
-      .replace(/^ERROR:\s*/i, "")
-      .slice(0, 320);
+  const detail = stripVTControlCharacters(line).trim();
+  if (
+    desktop &&
+    /\b(?:ENOSPC|EDQUOT)\b|no space left on (?:the )?device|not enough space on the disk|disk quota exceeded|the disk is full/i.test(
+      detail,
+    )
+  ) {
+    job.diskWriteFailed = true;
+  }
+  if (/^ERROR:/i.test(detail)) {
+    job.toolError = detail.replace(/^ERROR:\s*/i, "").slice(0, 320);
   }
 }
 
@@ -464,38 +484,49 @@ async function inspectOutput(job: Job) {
   }
 }
 
-async function watchStagingSize(job: Job) {
-  const dir = dataDir(job);
+async function diskIsLow(directory: string) {
+  try {
+    const { bavail, bsize } = await statfs(directory, { bigint: true });
+    return bsize > 0n && bavail * bsize < minimumFreeBytes;
+  } catch {
+    // The filesystem may not report capacity. The downloader still reports write failures.
+    return false;
+  }
+}
+
+async function previewIsOverSize(directory: string) {
   let bytes = 0;
   try {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
       if (!entry.isFile()) continue;
-      const item = await lstat(path.join(dir, entry.name)).catch(() => null);
+      const item = await lstat(path.join(directory, entry.name)).catch(() => null);
       bytes += item?.size ?? 0;
-      if (bytes > maxBytes) {
-        stopJob(job, "size");
-        return;
-      }
+      if (bytes > previewMaxBytes) return true;
     }
   } catch {
     // A finished or canceled job may already have removed its staging directory.
   }
+  return false;
 }
 
 async function finishJob(job: Job, code: number | null, signal: NodeJS.Signals | null) {
   const messages = downloadMessages(job.locale);
-  const result =
-    !job.stopReason && code === 0 && !signal && !job.toolError ? await inspectOutput(job) : null;
+  const toolFailed = code !== 0 || signal !== null || job.toolError !== null;
+  const diskFull =
+    job.stopReason === "space" || (!job.stopReason && toolFailed && job.diskWriteFailed);
+  const result = !job.stopReason && !toolFailed ? await inspectOutput(job) : null;
 
   let view: JobView;
   if (job.stopReason === "cancel") {
     view = terminalView(job, "canceled", null);
+  } else if (diskFull) {
+    view = terminalView(job, "error", messages.space);
   } else if (job.stopReason) {
     const key = job.stopReason === "shutdown" ? "interrupted" : job.stopReason;
     view = terminalView(job, "error", messages[key]);
-  } else if (code !== 0 || signal || job.toolError) {
+  } else if (toolFailed) {
     view = terminalView(job, "error", explainFailure(job));
-  } else if (!result || result.bytes > maxBytes) {
+  } else if (!result || (!desktop && result.bytes > previewMaxBytes)) {
     view = terminalView(job, "error", result ? messages.size : messages.missingOutput);
   } else {
     view = terminalView(job, "done", null, result);
@@ -503,12 +534,16 @@ async function finishJob(job: Job, code: number | null, signal: NodeJS.Signals |
 
   job.committing = true;
   const finishedAt = Math.max(job.view.startedAt, Date.now());
+  if (diskFull) {
+    await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
+  }
   try {
     await persist(job, view, finishedAt);
   } catch {
-    if (view.status !== "canceled") view = terminalView(job, "error", messages.storage);
+    if (view.status !== "canceled" && !diskFull)
+      view = terminalView(job, "error", messages.storage);
   }
-  if (view.status !== "done") {
+  if (view.status !== "done" && !diskFull) {
     await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
   }
   job.finishedAt = finishedAt;
@@ -551,22 +586,28 @@ function startDownloader(job: Job, tools: ResolvedTools) {
     job.toolError = downloadMessages(job.locale).missingTools;
   });
 
+  const storageCheck = desktop ? diskIsLow : previewIsOverSize;
+  const storageLimitReason = desktop ? "space" : "size";
   let checking = false;
-  const sizeTimer = setInterval(() => {
+  const storageTimer = setInterval(async () => {
     if (checking || job.view.status !== "running") return;
     checking = true;
-    void watchStagingSize(job).finally(() => {
+    try {
+      const shouldStop = await storageCheck(outputDir);
+      if (shouldStop && job.child === child) stopJob(job, storageLimitReason);
+    } finally {
       checking = false;
-    });
+    }
   }, 2000);
-  const timeTimer = setTimeout(() => stopJob(job, "timeout"), 12 * 60 * 1000);
-  sizeTimer.unref();
-  timeTimer.unref();
+  const timeTimer = desktop
+    ? null
+    : setTimeout(() => stopJob(job, "timeout"), 12 * 60 * 1000).unref();
+  storageTimer.unref();
 
   job.settled = new Promise<void>((resolve) => {
     child.once("close", (code, signal) => {
-      clearInterval(sizeTimer);
-      clearTimeout(timeTimer);
+      clearInterval(storageTimer);
+      if (timeTimer) clearTimeout(timeTimer);
       if (job.killTimer) {
         clearTimeout(job.killTimer);
         stopProcess(child, "SIGKILL");
@@ -617,12 +658,17 @@ async function launch(url: string, quality: JobView["quality"], locale: Locale) 
     await mkdir(job.dir, { mode: 0o700 });
     created = true;
     await mkdir(dataDir(job), { mode: 0o700 });
+    if (desktop && (await diskIsLow(dataDir(job)))) throw new DownloadError(messages.space, 507);
     await persist(job);
     if (store.shuttingDown) throw new DownloadError(messages.closing, 503);
     startDownloader(job, tools);
   } catch (error) {
     if (created) await rm(job.dir, { recursive: true, force: true }).catch(() => undefined);
     if (error instanceof DownloadError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (desktop && (code === "ENOSPC" || code === "EDQUOT")) {
+      throw new DownloadError(messages.space, 507);
+    }
     throw new DownloadError(messages.storage, 500);
   }
 
@@ -769,7 +815,7 @@ if (!runtime[shutdownKey]) {
   const halt = () => {
     void shutdownDownloads().finally(() => process.exit(0));
   };
-  if (process.env.LUOPIAN_DESKTOP !== "1") {
+  if (!desktop) {
     process.prependOnceListener("SIGTERM", halt);
     process.prependOnceListener("SIGINT", halt);
   }
