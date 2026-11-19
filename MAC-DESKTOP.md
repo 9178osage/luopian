@@ -10,4 +10,4 @@
 
 桌面版的临时任务位于 `~/Library/Application Support/Luopian/jobs`。程序会定期清理自己创建的任务目录，保留最近 100 个结束的任务，保留期约 3 小时。请及时把文件保存到自己选择的目录。
 
-从源码运行使用 `npm run electron:dev`。`npm run dist:mac` 会在 `release/` 生成使用临时签名的本机测试包。公开分发使用 [README 中的签名与公证流程](README.md#开发与打包)。开发和打包需要 Node.js，安装完成的桌面应用使用 Electron 自带的 Node 环境。
+从源码运行使用 `npm run electron:dev`。`npm run dist:mac` 会在 `release/` 生成使用临时签名的本机测试包。公开分发使用 `npm run dist:mac:release`，需要 Developer ID 签名身份和 `APPLE_KEYCHAIN_PROFILE` 指定的公证凭据。开发和打包需要 Node.js，安装完成的桌面应用使用 Electron 自带的 Node 环境。
