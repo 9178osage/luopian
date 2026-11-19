@@ -1,7 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="8" fill="#0e0f11"/>
-  <rect x="1.25" y="1.25" width="29.5" height="29.5" rx="7" fill="none" stroke="#e4e7ec" stroke-width="1.5"/>
-  <path d="M16 8.5v10" stroke="#e4e7ec" stroke-width="1.6" stroke-linecap="round"/>
-  <path d="M11.2 15.2 16 20.2l4.8-5" fill="none" stroke="#e4e7ec" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M10 23.5h12" stroke="#e4e7ec" stroke-width="1.6" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>落片</title>
+  <defs>
+    <linearGradient id="base" x1="190" y1="96" x2="836" y2="919" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3c497e" />
+      <stop offset=".52" stop-color="#242b50" />
+      <stop offset="1" stop-color="#15192e" />
+    </linearGradient>
+    <linearGradient id="rim" x1="174" y1="83" x2="828" y2="930" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a5b5fc" stop-opacity=".63" />
+      <stop offset=".6" stop-color="#a5b5fc" stop-opacity=".14" />
+      <stop offset="1" stop-color="#a5b5fc" stop-opacity=".26" />
+    </linearGradient>
+    <linearGradient id="frame" x1="365" y1="260" x2="648" y2="727" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f0f2ff" />
+      <stop offset=".58" stop-color="#c5cdff" />
+      <stop offset="1" stop-color="#a3aff5" />
+    </linearGradient>
+  </defs>
+  <rect x="88" y="102" width="848" height="848" rx="190" fill="#0b0f21" opacity=".24" />
+  <rect x="88" y="82" width="848" height="848" rx="190" fill="url(#base)" />
+  <rect x="91" y="85" width="842" height="842" rx="187" fill="none" stroke="url(#rim)" stroke-width="6" />
+  <path
+    fill="url(#frame)"
+    fill-rule="evenodd"
+    d="M326 278h372a60 60 0 0 1 60 60v188a60 60 0 0 1-60 60H591l-56 64a30 30 0 0 1-46 0l-56-64H326a60 60 0 0 1-60-60V338a60 60 0 0 1 60-60Zm151 78c-11-6-24 1-24 14v124c0 13 13 20 24 14l111-62c11-6 11-22 0-28Z"
+  />
+  <path d="M343 691v10a32 32 0 0 0 32 32h274a32 32 0 0 0 32-32v-10" fill="none" stroke="#aab7ff" stroke-linecap="round" stroke-width="34" />
 </svg>

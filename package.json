@@ -113,6 +113,7 @@
     "appId": "com.luopian.app",
     "productName": "落片",
     "copyright": "Copyright © Luopian",
+    "icon": "public/favicon.svg",
     "directories": {
       "app": "electron",
       "output": "release"
