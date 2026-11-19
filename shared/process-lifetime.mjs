@@ -1,3 +1,5 @@
+import { setTimeout as sleep } from "node:timers/promises";
+
 /** @param {number} pid Process ID, or a negative process group ID on Unix. */
 export function processIsAlive(pid) {
   try {
@@ -6,4 +8,13 @@ export function processIsAlive(pid) {
   } catch (error) {
     return /** @type {NodeJS.ErrnoException} */ (error).code !== "ESRCH";
   }
+}
+/** @param {number} pid Process ID, or a negative process group ID on Unix. */
+export async function waitForProcessExit(pid) {
+  const deadline = performance.now() + 3000;
+  while (processIsAlive(pid)) {
+    if (performance.now() >= deadline) return false;
+    await sleep(50);
+  }
+  return true;
 }

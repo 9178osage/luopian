@@ -1,12 +1,15 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline";
 
-import { processIsAlive } from "./process-lifetime.mjs";
+import { processIsAlive, waitForProcessExit } from "./process-lifetime.mjs";
 
 const partialName = "transfer.part";
 const stateName = "transfer.json";
+const ariaLogName = "transfer.aria2.log";
 const curlOptions = [
   "--disable",
   "--globoff",
@@ -34,7 +37,8 @@ const curlOptions = [
 /** @typedef {{ percent: number, speed?: string, eta?: string }} Progress */
 /** @typedef {{ url: string, directory: string, curl: string, aria2?: string | null, env: NodeJS.ProcessEnv, onProcess?: (child: import('node:child_process').ChildProcess | null) => void, onProgress?: (progress: Progress) => void, checkActive?: () => void }} Transfer */
 /** @typedef {{ length: number | null, resource: string | null, validator: string | null, filename: string, ranges: boolean, html: boolean }} Metadata */
-/** @typedef {{ url: string, meta: Metadata } & ({ backend: 'curl', bytes: number } | { backend: 'curl', bytes: null, writer: number } | { backend: 'aria2' })} Recovery */
+/** @typedef {{ url: string, meta: Metadata, backend: 'aria2', writer?: number }} AriaRecovery */
+/** @typedef {({ url: string, meta: Metadata } & ({ backend: 'curl', bytes: number } | { backend: 'curl', bytes: null, writer: number })) | AriaRecovery} Recovery */
 
 export class FileDownloadError extends Error {
   /** @param {'webpage' | 'http' | 'transfer' | 'space' | 'write'} kind @param {number} [status] */
@@ -139,43 +143,45 @@ function responseInfo(output, originalUrl, singleRequest = false) {
   };
 }
 
-/** @param {string} validator */
-function verifyAriaResponses(validator) {
+/** @param {string} directory @param {string} validator */
+async function verifyAriaLog(directory, validator) {
+  const filename = path.join(directory, ariaLogName);
+  if (!(await fileSize(filename))) return { verified: false, changed: false };
   let waitingForStatus = false;
   let status = 0;
   let etag = "";
   let verified = false;
   let changed = false;
-  return {
-    /** @param {string} raw */
-    read(raw) {
-      const line = raw.trimEnd();
-      // aria2's info log reports the complete response head for each connection.
-      if (/\bCUID#\d+ - Response received:$/.test(line)) {
-        waitingForStatus = true;
-        return;
+  const lines = createInterface({ input: createReadStream(filename), crlfDelay: Infinity });
+  for await (const raw of lines) {
+    const line = raw.trimEnd();
+    // aria2 flushes this info record before consuming the corresponding response body.
+    if (
+      /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ \[INFO\] \[.+:\d+\] CUID#\d+ - Response received:$/.test(
+        line,
+      )
+    ) {
+      changed ||= Boolean(status || waitingForStatus);
+      waitingForStatus = true;
+    } else if (waitingForStatus) {
+      waitingForStatus = false;
+      status = Number(/^HTTP\/\S+ (\d{3})(?:\s|$)/.exec(line)?.[1] ?? 0);
+      changed ||= status === 0;
+      etag = "";
+    } else if (status && !line) {
+      if (status === 200 || status === 206) {
+        if (etag === validator) verified = true;
+        else changed = true;
+      } else if (status >= 300 && status < 400) {
+        // A redirect can select a different resource with the same ETag.
+        changed = true;
       }
-      if (waitingForStatus) {
-        waitingForStatus = false;
-        status = Number(/^HTTP\/\S+ (\d{3})(?:\s|$)/.exec(line)?.[1] ?? 0);
-        etag = "";
-      } else if (status && !line) {
-        if (status === 200 || status === 206) {
-          if (etag === validator) verified = true;
-          else changed = true;
-        } else if (status >= 300 && status < 400) {
-          // A redirect can select a different resource with the same ETag.
-          changed = true;
-        }
-        status = 0;
-      } else if (status && /^etag:/i.test(line)) {
-        etag = etag ? "invalid" : line.slice(5).trim();
-      }
-    },
-    result() {
-      return { verified: verified && !changed && !status && !waitingForStatus, changed };
-    },
-  };
+      status = 0;
+    } else if (status && /^etag:/i.test(line)) {
+      etag = etag ? "invalid" : line.slice(5).trim();
+    }
+  }
+  return { verified: verified && !changed && !status && !waitingForStatus, changed };
 }
 
 /** @param {string} filename */
@@ -190,8 +196,8 @@ async function fileSize(filename) {
   }
 }
 
-/** @param {Transfer} options @param {string} command @param {string[]} args @param {'curl' | 'aria2'} backend @param {{ validator?: string, onHeaders?: (head: string, pid: number) => Promise<void> }} controls */
-function run(options, command, args, backend, { validator, onHeaders } = {}) {
+/** @param {Transfer} options @param {string} command @param {string[]} args @param {'curl' | 'aria2'} backend @param {{ onSpawn?: (pid: number) => Promise<void>, onHeaders?: (head: string, pid: number) => Promise<void> }} controls */
+function run(options, command, args, backend, { onSpawn, onHeaders } = {}) {
   options.checkActive?.();
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -203,10 +209,8 @@ function run(options, command, args, backend, { validator, onHeaders } = {}) {
     let stdout = "";
     let stderr = "";
     let tail = "";
-    let responseTail = "";
     /** @type {Promise<void> | undefined} */
     let headerSaved;
-    const responses = validator ? verifyAriaResponses(validator) : null;
     /** @type {NodeJS.ErrnoException | undefined} */
     let error;
     const progress = (/** @type {string} */ chunk) => {
@@ -221,11 +225,6 @@ function run(options, command, args, backend, { validator, onHeaders } = {}) {
       }
     };
     child.stdout.setEncoding("utf8").on("data", (chunk) => {
-      if (responses) {
-        const lines = (responseTail + chunk).split("\n");
-        responseTail = (lines.pop() ?? "").slice(-128 * 1024);
-        for (const line of lines) responses.read(line);
-      }
       if (backend === "aria2") progress(chunk);
       else {
         stdout = (stdout + chunk).slice(-128 * 1024);
@@ -245,6 +244,7 @@ function run(options, command, args, backend, { validator, onHeaders } = {}) {
     });
     child.once("close", async (code) => {
       options.onProcess?.(null);
+      await writerSaved;
       await headerSaved;
       const diskFull =
         (backend === "aria2" && code === 9) ||
@@ -253,10 +253,15 @@ function run(options, command, args, backend, { validator, onHeaders } = {}) {
         code,
         stdout,
         error,
-        responses: responses?.result(),
         writeFailure: diskFull ? "space" : backend === "curl" && code === 23 ? "write" : null,
       });
     });
+    const writerSaved = child.pid
+      ? onSpawn?.(child.pid).catch((cause) => {
+          error = cause;
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+        })
+      : undefined;
     options.onProcess?.(child);
   });
 }
@@ -280,12 +285,13 @@ async function recovery(directory, url) {
       (meta.length === null || (Number.isSafeInteger(meta.length) && meta.length >= 0)) &&
       typeof v === "string" &&
       strongETag(v) &&
-      (state.backend !== "curl" ||
-        (state.bytes === null
+      (state.backend === "curl"
+        ? state.bytes === null
           ? Number.isSafeInteger(state.writer) && state.writer > 0
           : Number.isSafeInteger(state.bytes) &&
             state.bytes > 0 &&
-            (meta.length === null || state.bytes < meta.length)))
+            (meta.length === null || state.bytes < meta.length)
+        : state.writer === undefined || (Number.isSafeInteger(state.writer) && state.writer >= 0))
     )
       return state;
   } catch {
@@ -304,7 +310,7 @@ async function checkpoint(directory, state) {
 
 /** @param {string} directory */
 async function clearPartial(directory) {
-  for (const name of [stateName, partialName, `${partialName}.aria2`]) {
+  for (const name of [stateName, partialName, `${partialName}.aria2`, ariaLogName]) {
     await rm(path.join(directory, name), { force: true });
   }
 }
@@ -453,6 +459,17 @@ async function curlDownload(options, part, state) {
   throw new FileDownloadError(status >= 400 ? "http" : "transfer", status);
 }
 
+/** @param {string} directory @param {string} part @param {AriaRecovery} state */
+async function canResumeAria(directory, part, state) {
+  if (!(await fileSize(part)) || !(await fileSize(`${part}.aria2`))) return false;
+  if (state.writer === undefined) return true;
+  if (!state.writer || !state.meta.validator) return false;
+  // The retry waits for a surviving writer before inspecting its journal or touching its files.
+  return (
+    processIsAlive(state.writer) || (await verifyAriaLog(directory, state.meta.validator)).verified
+  );
+}
+
 /** @param {Transfer} options @param {string} part @param {Recovery | null} state */
 async function ariaDownload(options, part, state) {
   const result = await run(
@@ -486,18 +503,25 @@ async function ariaDownload(options, part, state) {
   ) {
     return curlDownload(options, part, null);
   }
-  const previous = state?.meta;
-  if (
-    !previous?.validator ||
-    previous.validator !== meta.validator ||
-    previous.resource !== meta.resource ||
-    previous.length !== meta.length ||
-    (await fileSize(`${part}.aria2`)) === null
-  ) {
+  /** @type {AriaRecovery} */
+  const confirmed = { url: options.url, backend: "aria2", meta };
+  const resuming =
+    state?.backend === "aria2" &&
+    state.meta.validator === meta.validator &&
+    state.meta.resource === meta.resource &&
+    state.meta.length === meta.length &&
+    (await canResumeAria(options.directory, part, state));
+  if (resuming) {
+    // Record the accepted prefix before rotating its journal for the next attempt.
+    await checkpoint(options.directory, confirmed);
+  } else {
     await clearPartial(options.directory);
   }
-  // Save recovery metadata only after checking the headers from this attempt.
-  await rm(path.join(options.directory, stateName), { force: true });
+  const log = path.join(options.directory, ariaLogName);
+  await rm(log, { force: true });
+  await writeFile(log, "", { flag: "wx", mode: 0o600 });
+  // The HEAD metadata is provisional until the actual GET responses are audited.
+  await checkpoint(options.directory, { ...confirmed, writer: 0 });
   const download = await run(
     options,
     options.aria2 ?? "aria2c",
@@ -510,6 +534,7 @@ async function ariaDownload(options, part, state) {
       "--auto-file-renaming=false",
       "--file-allocation=none",
       "--continue=true",
+      ...(resuming ? ["--use-head=true"] : []),
       "--max-connection-per-server=4",
       "--split=4",
       "--min-split-size=2M",
@@ -518,9 +543,10 @@ async function ariaDownload(options, part, state) {
       "--max-tries=3",
       "--retry-wait=1",
       "--summary-interval=0",
-      "--log=-",
+      `--log=${log}`,
       "--log-level=info",
       "--auto-save-interval=1",
+      `--stop-with-process=${process.pid}`,
       "--enable-color=false",
       "--header=Accept-Encoding: identity",
       `--header=If-Match: ${meta.validator}`,
@@ -530,18 +556,22 @@ async function ariaDownload(options, part, state) {
       effectiveUrl,
     ],
     "aria2",
-    { validator: meta.validator },
+    { onSpawn: (writer) => checkpoint(options.directory, { ...confirmed, writer }) },
   );
   if (download.writeFailure) {
     await clearPartial(options.directory);
     throw new FileDownloadError(download.writeFailure);
   }
+  const responses = await verifyAriaLog(options.directory, meta.validator);
   if (
     download.code === 0 &&
-    download.responses?.verified &&
+    !download.error &&
+    responses.verified &&
     (await fileSize(part)) === meta.length &&
     (await fileSize(`${part}.aria2`)) === null
   ) {
+    await rm(path.join(options.directory, stateName), { force: true });
+    await rm(log, { force: true });
     return { part, filename: meta.filename };
   }
   // A server that declines range requests can still be downloaded with curl.
@@ -549,12 +579,13 @@ async function ariaDownload(options, part, state) {
     download.code === 0 ||
     download.code === 8 ||
     download.code === 22 ||
-    download.responses?.changed ||
+    responses.changed ||
     download.error?.code === "ENOENT"
   )
     return curlDownload(options, part, null);
-  if (download.responses?.verified && (await fileSize(`${part}.aria2`)) !== null) {
-    await checkpoint(options.directory, { url: options.url, backend: "aria2", meta });
+  if (responses.verified && (await fileSize(`${part}.aria2`)) !== null) {
+    await checkpoint(options.directory, confirmed);
+    await rm(log, { force: true });
   } else {
     await clearPartial(options.directory);
   }
@@ -569,6 +600,9 @@ export async function downloadDirectFile(options) {
     throw new Error("Unexpected transfer directory");
   const part = path.join(options.directory, partialName);
   const saved = await recovery(options.directory, options.url);
+  if (saved?.backend === "aria2" && saved.writer && !(await waitForProcessExit(saved.writer))) {
+    throw new FileDownloadError("transfer");
+  }
   return options.aria2 && saved?.backend !== "curl"
     ? ariaDownload(options, part, saved)
     : curlDownload(options, part, saved);
@@ -579,9 +613,6 @@ export async function hasDirectCheckpoint(directory, url) {
   const saved = await recovery(directory, url);
   if (!saved) return false;
   const part = path.join(directory, partialName);
-  const size = await fileSize(part);
-  if (!size) return false;
-  return saved.backend === "curl"
-    ? recoverableBytes(saved, size) > 0
-    : (await fileSize(`${part}.aria2`)) !== null;
+  if (saved.backend === "aria2") return canResumeAria(directory, part, saved);
+  return recoverableBytes(saved, (await fileSize(part)) ?? 0) > 0;
 }

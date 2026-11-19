@@ -26,7 +26,7 @@ import {
   FileDownloadError,
   hasDirectCheckpoint,
 } from "../shared/direct-download.mjs";
-import { processIsAlive } from "../shared/process-lifetime.mjs";
+import { processIsAlive, waitForProcessExit } from "../shared/process-lifetime.mjs";
 import {
   extractDownloadUrls,
   isOutput,
@@ -255,7 +255,7 @@ async function restoreStaging(outDir, prefix, directory) {
       if (
         !Number.isSafeInteger(writer) ||
         writer <= 0 ||
-        processIsAlive(windows ? writer : -writer)
+        !(await waitForProcessExit(windows ? writer : -writer))
       ) {
         continue;
       }

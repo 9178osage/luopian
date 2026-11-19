@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { appendFile, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -315,6 +316,145 @@ test(
     assert.deepEqual(await readFile(result.part), complete);
   },
 );
+
+for (const scenario of ["CLI", "desktop", "changed HEAD", "unverified segments"]) {
+  test(
+    "aria2 recovers safely after a forced exit: " + scenario,
+    { skip: curlMissing || !tools.aria2 || process.platform === "win32", timeout: 22000 },
+    async (t) => {
+      const mib = 1024 ** 2;
+      const bytes = Buffer.concat(
+        Array.from({ length: 12 }, (_, index) => Buffer.alloc(mib, index)),
+      );
+      const replacement = Buffer.alloc(bytes.length, 75);
+      const contents = scenario === "changed HEAD" ? replacement : bytes;
+      const retryStarts = [];
+      let retryBytes = 0;
+      let firstWrite = 0;
+      let restarting = false;
+      const server = await fixture(t, async (req, res) => {
+        const updated = restarting && scenario === "changed HEAD";
+        const correctTag = updated ? '"updated"' : '"original"';
+        res.setHeader("Accept-Ranges", "bytes");
+        res.setHeader("Content-Disposition", "attachment; filename=crash.zip");
+        if (req.method === "HEAD") {
+          return res.writeHead(200, { ETag: correctTag, "Content-Length": bytes.length }).end();
+        }
+        const unsafe = !restarting && scenario === "unverified segments";
+        const data = updated || unsafe ? replacement : bytes;
+        res.setHeader("ETag", unsafe ? '"unexpected"' : correctTag);
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? "");
+        const start = range ? Number(range[1]) : 0;
+        const end = range?.[2] ? Number(range[2]) + 1 : data.length;
+        if (range) {
+          res.statusCode = 206;
+          res.setHeader("Content-Range", "bytes " + start + "-" + (end - 1) + "/" + data.length);
+        }
+        res.setHeader("Content-Length", end - start);
+        if (!restarting) {
+          res.write(data.subarray(start, Math.min(end, start + 1.5 * mib)));
+          if (start === 0) firstWrite = Date.now();
+          return;
+        }
+        assert.equal(req.headers["if-match"], correctTag);
+        retryStarts.push(start);
+        for (let cursor = start; cursor < end && !res.destroyed; cursor += 64 * 1024) {
+          const chunk = data.subarray(cursor, Math.min(end, cursor + 64 * 1024));
+          retryBytes += chunk.length;
+          res.write(chunk);
+          await sleep(4);
+        }
+        res.end();
+      });
+      if (!server) return;
+      const desktop = scenario === "desktop";
+      const workRoot = desktop ? path.join(server.directory, "jobs") : server.directory;
+      const childEnv = {
+        ...env,
+        LUOPIAN_ARIA2: tools.aria2,
+        LUOPIAN_DESKTOP: "1",
+        LUOPIAN_ROOT: workRoot,
+        LUOPIAN_TEST_FILE: server.url,
+      };
+      const evalArgs = ["--experimental-strip-types", "--input-type=module", "-e"];
+      const cliArgs = [cli, "--aria2", "-o", server.directory, server.url];
+      const child = spawn(
+        process.execPath,
+        desktop
+          ? [
+              ...evalArgs,
+              "const engine = await import(" +
+                JSON.stringify(engineModule) +
+                "); await engine.startJob({ url: process.env.LUOPIAN_TEST_FILE, accelerate: true });",
+            ]
+          : cliArgs,
+        { env: childEnv, stdio: "ignore" },
+      );
+      const exited = once(child, "exit");
+      t.after(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      });
+      const checkpoint = await waitForValue(async () => {
+        if (!firstWrite) return null;
+        try {
+          const [job] = await readdir(workRoot);
+          const directory = path.join(workRoot, job, "transfer");
+          const state = JSON.parse(await readFile(path.join(directory, "transfer.json"), "utf8"));
+          const control = await stat(path.join(directory, "transfer.part.aria2"));
+          return state.backend === "aria2" && state.writer > 0 && control.mtimeMs > firstWrite + 200
+            ? state
+            : null;
+        } catch {
+          return null;
+        }
+      });
+      assert.equal(child.kill("SIGKILL"), true);
+      // The CLI case leaves its writer alive to exercise aria2's parent watcher.
+      if (scenario !== "CLI") process.kill(checkpoint.writer, "SIGKILL");
+      assert.deepEqual(await exited, [null, "SIGKILL"]);
+      restarting = true;
+
+      if (desktop) {
+        await waitForValue(() => !processIsAlive(checkpoint.writer));
+        const code = `
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { setTimeout as sleep } from "node:timers/promises";
+          const engine = await import(${JSON.stringify(engineModule)});
+          const [job] = await engine.listJobs();
+          assert.equal(job.status, "error");
+          assert.equal(job.resumable, true);
+          assert.equal((await engine.retryJob(job.id)).id, job.id);
+          for (let attempt = 0; attempt < 240; attempt++) {
+            if ((await engine.getJob(job.id)).status === "done") break;
+            await sleep(25);
+          }
+          const saved = await engine.openJobFile(job.id);
+          assert.equal(saved.status, 200);
+          process.stdout.write(createHash("sha256").update(Buffer.from(await saved.arrayBuffer())).digest("hex"));
+          await engine.shutdownDownloads();
+        `;
+        const result = await exec(process.execPath, [...evalArgs, code], {
+          env: childEnv,
+          timeout: 10000,
+        });
+        assert.equal(result.stdout, createHash("sha256").update(contents).digest("hex"));
+      } else {
+        await exec(process.execPath, cliArgs, { env: childEnv, timeout: 10000 });
+        assert.deepEqual(await readFile(path.join(server.directory, "crash.zip")), contents);
+        assert.deepEqual(await readdir(server.directory), ["crash.zip"]);
+      }
+      if (scenario === "CLI" || desktop) {
+        t.diagnostic("Retried " + retryBytes + " of " + bytes.length + " bytes.");
+        assert.ok(!retryStarts.includes(0), JSON.stringify(retryStarts));
+        assert.ok(retryBytes < bytes.length, String(retryBytes));
+      } else {
+        assert.ok(retryStarts.includes(0), JSON.stringify(retryStarts));
+        assert.ok(retryBytes >= bytes.length, String(retryBytes));
+      }
+    },
+  );
+}
 
 test(
   "desktop resumes a direct file and serves it through the save endpoint",
