@@ -1,12 +1,29 @@
+import { createMiddleware } from "@tanstack/react-start";
+
+import { desktopRequestNonce } from "../desktop-request.server.ts";
 import { parseLocale } from "../i18n.ts";
 import { downloadMessages } from "./messages.ts";
 
-const MAX_REQUEST_BYTES = 8 * 1024;
+const MAX_REQUEST_BYTES = 96 * 1024;
 export const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export function jobJson(data: unknown, status = 200) {
   return Response.json(data, { status, headers: { "cache-control": "no-store" } });
 }
+
+export const desktopDownloads = createMiddleware().server(({ next, request }) => {
+  if (desktopRequestNonce()) return next();
+  const locale = parseLocale(new URL(request.url).searchParams.get("lang"));
+  return jobJson(
+    {
+      error:
+        locale === "zh"
+          ? "下载功能在落片桌面版中可用。"
+          : "Downloads are available in the desktop app.",
+    },
+    404,
+  );
+});
 
 export function guardStudioMutation(request: Request, requireJson = true): Response | null {
   const url = new URL(request.url);

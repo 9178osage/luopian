@@ -22,7 +22,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const APP_ENV_REL_PATH = ".grok/app-env.json";
@@ -104,14 +104,40 @@ export function isMainModule(moduleUrl) {
   }
 }
 
+function previewingDesktopBuild(root) {
+  const lastBuild = join(root, "node_modules", ".nitro", "last-build.json");
+  try {
+    const { outputDir } = JSON.parse(readFileSync(lastBuild, "utf8"));
+    return resolve(lastBuild, outputDir) === join(root, "dist", "desktop");
+  } catch {
+    return false;
+  }
+}
+
 function main(argv) {
   const [command, ...args] = argv;
   if (!command) {
     console.error("usage: node scripts/with-app-env.mjs <command> [args…]");
     process.exit(2);
   }
-  const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  const root = projectRoot();
+  if (command === "vite" && args[0] === "preview" && previewingDesktopBuild(root)) {
+    console.error(
+      "Desktop build: run npm run electron:start. For web preview, run npm run build first.",
+    );
+    process.exit(1);
+  }
+  const env = mergeAppEnv(readAppEnv(root), process.env);
+  // Launch Vite through Node so Windows does not need to execute vite.cmd.
+  const [bin, ...commandArgs] =
+    command === "vite"
+      ? [
+          process.execPath,
+          join(dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin", "vite.js"),
+          ...args,
+        ]
+      : [command, ...args];
+  const child = spawn(bin, commandArgs, { stdio: "inherit", env });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));

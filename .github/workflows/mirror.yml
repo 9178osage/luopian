@@ -9,18 +9,28 @@ concurrency:
   group: gitlab-mirror
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   mirror:
+    if: github.repository == '9178osage/luopian' || vars.GITLAB_MIRROR_PROJECT != ''
     runs-on: ubuntu-latest
     steps:
       - name: Push branches and tags to GitLab
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_MIRROR_PROJECT: ${{ vars.GITLAB_MIRROR_PROJECT }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          target="${GITLAB_MIRROR_PROJECT:-personal-projects7420146/${GITHUB_REPOSITORY#*/}}"
+          if [[ ! "$target" =~ ^[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)+$ || "/$target/" =~ /\.\.?/ ]]; then
+            echo "Set GITLAB_MIRROR_PROJECT to a GitLab namespace and project path." >&2
+            exit 1
+          fi
+          : "${GITLAB_TOKEN:?Configure the mirror token for this repository}"
           git clone --bare "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo.git
           cd repo.git
-          git push --prune "https://oauth2:${GITLAB_TOKEN}@gitlab.com/personal-projects7420146/${REPO_NAME}.git" \
+          git push --prune "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${target%.git}.git" \
             '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'

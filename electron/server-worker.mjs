@@ -1,4 +1,5 @@
-import { timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
 
@@ -6,6 +7,8 @@ const [bundle, requestedPort] = process.argv.slice(2);
 const token = Buffer.from(process.env.LUOPIAN_DESKTOP_TOKEN ?? "", "utf8");
 delete process.env.LUOPIAN_DESKTOP_TOKEN;
 const shutdownDownloads = Symbol.for("luopian.shutdownDownloads");
+const desktopRequest = Symbol.for("luopian.desktopRequest");
+const requests = new AsyncLocalStorage();
 
 let server;
 let shuttingDown = false;
@@ -58,6 +61,8 @@ async function serve() {
     throw new Error("Missing desktop service configuration.");
   const port = Number(requestedPort);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Invalid desktop port.");
+  process.env.LUOPIAN_DESKTOP = "1";
+  globalThis[desktopRequest] = requests;
   const { middleware } = await import(pathToFileURL(bundle).href);
   if (typeof middleware !== "function") throw new Error("The desktop bundle has no HTTP handler.");
   if (shuttingDown) return;
@@ -84,8 +89,24 @@ async function serve() {
     ]) {
       delete request.headers[name];
     }
+    const nonce = randomBytes(18).toString("base64");
+    response.setHeader(
+      "Content-Security-Policy",
+      [
+        "default-src 'none'",
+        `script-src 'self' 'nonce-${nonce}'`,
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' https://i.ytimg.com https://img.youtube.com https://*.hdslb.com https://*.biliimg.com",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+      ].join("; "),
+    );
+    response.setHeader("Referrer-Policy", "no-referrer");
+    response.setHeader("X-Content-Type-Options", "nosniff");
     try {
-      await middleware(request, response);
+      await requests.run(nonce, () => middleware(request, response));
     } catch (error) {
       console.error(error);
       if (response.headersSent) response.destroy();

@@ -16,6 +16,7 @@
  */
 import installPageTemplate from "../../scripts/install-page.html?raw";
 import { grokOgIdentity } from "virtual:grok-og-identity";
+import { desktopRequestNonce } from "../../src/lib/desktop-request.server.ts";
 import {
   acceptsHtml,
   createHeadInjector,
@@ -64,6 +65,7 @@ export default async function grokPwaMiddleware(
   event: GrokPwaEvent,
   next: () => unknown | Promise<unknown>,
 ): Promise<unknown> {
+  if (desktopRequestNonce()) return next();
   const method = (event.req.method ?? "GET").toUpperCase();
   if (method !== "GET") return next();
 

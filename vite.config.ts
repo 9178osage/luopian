@@ -167,7 +167,7 @@ export default defineConfig(({ command, isPreview, mode }) => ({
     // Dev-only /__app-env, read by scripts/check-auth-invariant.mjs.
     appEnvPlugin(),
     // PWA head + ?install=1 tutorial page; runs before Start/Nitro.
-    grokPwaPlugin(),
+    ...(mode === "desktop" ? [] : [grokPwaPlugin()]),
     tailwindcss(),
     tanstackStart(),
     ...(command === "build" || isPreview
@@ -187,7 +187,7 @@ export default defineConfig(({ command, isPreview, mode }) => ({
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.
-            serverDir: "./server",
+            serverDir: mode === "desktop" ? false : "./server",
           }),
         ]
       : []),

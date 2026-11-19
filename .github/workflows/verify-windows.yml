@@ -1,0 +1,30 @@
+name: Verify Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run dist:win -- --publish never
+      - name: Check the installer exists
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem release -Filter '*.exe' -File)) {
+            throw 'The Windows installer is missing.'
+          }

@@ -18,48 +18,66 @@ import { Readable } from "node:stream";
 import { promisify, stripVTControlCharacters } from "node:util";
 
 import { brewPathEnv, resolveTools } from "../../../cli/tools.mjs";
+import { processIsAlive } from "../../../shared/process-lifetime.mjs";
 import {
+  downloadDirectFile,
+  FileDownloadError,
+  hasDirectCheckpoint,
+  safeFilename,
+} from "../../../shared/direct-download.mjs";
+import {
+  isOutput,
   isQuality,
-  normalizeYouTubeUrl,
-  VIDEO_FILENAME,
-  youtubeArgs,
-} from "../../../shared/youtube.mjs";
+  MAX_BATCH_URLS,
+  normalizeFileUrl,
+  normalizeVideoUrl,
+  outputExtension,
+  resolveVideoUrl,
+  videoArgs,
+  videoFilename,
+  type Output,
+} from "../../../shared/video.mjs";
 import { parseLocale, type Locale } from "../i18n.ts";
 import { downloadMessages } from "./messages.ts";
 import { JOB_ID, jobJson } from "./request-guard.ts";
-import type { EngineInfo, JobView } from "./types.ts";
+import type { EngineInfo, FileDownloader, JobView } from "./types.ts";
 
 const windows = process.platform === "win32";
 const desktop = process.env.LUOPIAN_DESKTOP === "1";
 const home = os.homedir();
 const root = path.resolve(
   process.env.LUOPIAN_ROOT ||
-    (process.platform === "darwin"
-      ? path.join(home, "Library", "Application Support", "Luopian", "jobs")
-      : windows
-        ? path.join(
-            process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"),
-            "Luopian",
-            "jobs",
-          )
-        : path.join(os.tmpdir(), "luopian")),
+    (!desktop
+      ? path.join(os.tmpdir(), "luopian-preview")
+      : process.platform === "darwin"
+        ? path.join(home, "Library", "Application Support", "Luopian", "jobs")
+        : windows
+          ? path.join(
+              process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"),
+              "Luopian",
+              "jobs",
+            )
+          : path.join(os.tmpdir(), "luopian")),
 );
 const manifest = ".luopian-job.json";
 const minimumFreeBytes = 512n * 1024n ** 2n;
 const previewMaxBytes = 2 * 1024 ** 3;
 const keepFor = 3 * 60 * 60 * 1000;
-const keepCount = 8;
+const queueLimit = 100;
+const keepCount = queueLimit;
 const outputPrefix = "luopian-file:";
 const progressPrefix = "luopian-progress:";
 const exec = promisify(execFile);
 
 type StopReason = "cancel" | "space" | "timeout" | "size" | "shutdown";
+type Settings = { quality: JobView["quality"]; output?: Output; file?: FileDownloader };
 
 type SavedJob = {
   schema: 1;
   ownerPid: number;
   locale: Locale;
   finishedAt: number | null;
+  queueOrder?: number;
   view: JobView;
 };
 
@@ -81,6 +99,9 @@ type Store = {
   active: Job | null;
   loading: Promise<void> | null;
   pruning: Promise<void> | null;
+  mutations: Promise<void>;
+  pump: Promise<void> | null;
+  nextQueueOrder: number;
   shuttingDown: boolean;
 };
 
@@ -90,8 +111,16 @@ const store = ((globalThis as typeof globalThis & { __luopianVideo?: Store }).__
   active: null,
   loading: null,
   pruning: null,
+  mutations: Promise.resolve(),
+  pump: null,
+  nextQueueOrder: 1,
   shuttingDown: false,
 });
+// Vite can retain an older queue in the same process while reloading this module.
+store.mutations ??= Promise.resolve();
+store.pump ??= null;
+store.nextQueueOrder ??=
+  1 + Math.max(0, ...Array.from(store.jobs.values(), (job) => job.queueOrder ?? 0));
 
 export class DownloadError extends Error {
   readonly status: number;
@@ -102,19 +131,58 @@ export class DownloadError extends Error {
   }
 }
 
-function videoFilename(name: unknown): name is string {
+function validOutputFilename(name: unknown, { output, file }: Settings): name is string {
   return (
     typeof name === "string" &&
     path.basename(name) === name &&
     !name.includes("/") &&
     !name.includes("\\") &&
     !name.includes("\0") &&
-    /\.(mp4|webm|mkv|m4v|3gp|mov|flv)$/i.test(name)
+    (file
+      ? name === safeFilename(name)
+      : output === undefined
+        ? /\.(mp4|webm|mkv|m4v|3gp|mov|flv)$/i.test(name)
+        : path.extname(name).toLowerCase() === `.${outputExtension(output)}`)
   );
 }
 
 function dataDir(job: Job) {
   return path.join(job.dir, "files");
+}
+
+function transferDir(job: Job) {
+  return path.join(job.dir, "transfer");
+}
+
+async function discardFiles(job: Job) {
+  const dirs = job.view.file ? [dataDir(job), transferDir(job)] : [dataDir(job)];
+  await Promise.all(
+    dirs.map((dir) => rm(dir, { recursive: true, force: true }).catch(() => undefined)),
+  );
+}
+
+function videoScratch(name: string) {
+  return /(?:\.part(?:-Frag\d+)?|\.ytdl|\.f\d+[\w.-]*\.[a-z0-9]+)$/i.test(name);
+}
+
+async function hasCheckpoint(job: Job) {
+  if (!desktop) return false;
+  try {
+    if (job.view.file) return await hasDirectCheckpoint(transferDir(job), job.view.url);
+    const directory = dataDir(job);
+    if (!(await lstat(directory)).isDirectory()) return false;
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (
+        entry.isFile() &&
+        videoScratch(entry.name) &&
+        (await lstat(path.join(directory, entry.name))).size > 0
+      )
+        return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function createJob(saved: SavedJob, dir: string): Job {
@@ -138,7 +206,7 @@ function terminalView(
   error: string | null,
   result?: { filename: string; bytes: number },
 ): JobView {
-  return {
+  const view: JobView = {
     ...job.view,
     status,
     percent: status === "done" ? 100 : null,
@@ -148,6 +216,8 @@ function terminalView(
     bytes: result?.bytes ?? null,
     error,
   };
+  delete view.resumable;
+  return view;
 }
 
 async function persist(job: Job, view = job.view, finishedAt = job.finishedAt) {
@@ -157,6 +227,7 @@ async function persist(job: Job, view = job.view, finishedAt = job.finishedAt) {
     ownerPid: job.ownerPid,
     locale: job.locale,
     finishedAt,
+    queueOrder: job.queueOrder,
     view,
   };
   try {
@@ -176,6 +247,7 @@ async function readManifest(dir: string, id: string): Promise<SavedJob | null> {
     if (!details.isFile() || details.size > 8192) return null;
     const saved = JSON.parse(await readFile(marker, "utf8")) as SavedJob;
     const view = saved?.view;
+    const file = view?.file;
     if (
       saved?.schema !== 1 ||
       !Number.isSafeInteger(saved.ownerPid) ||
@@ -183,13 +255,31 @@ async function readManifest(dir: string, id: string): Promise<SavedJob | null> {
       !["zh", "en"].includes(saved.locale) ||
       view?.id !== id ||
       !view.url ||
-      normalizeYouTubeUrl(view.url) !== view.url ||
+      (file === undefined
+        ? normalizeVideoUrl(view.url) !== view.url
+        : !desktop ||
+          (file !== "curl" && file !== "aria2") ||
+          normalizeFileUrl(view.url) !== view.url) ||
+      (view.url.startsWith("https://b23.tv/") &&
+        !["queued", "error", "canceled"].includes(view.status)) ||
       !isQuality(view.quality) ||
+      (view.output !== undefined && !isOutput(view.output)) ||
+      (view.resumable !== undefined && typeof view.resumable !== "boolean") ||
+      (view.retryOf !== undefined && (!JOB_ID.test(view.retryOf) || view.retryOf === id)) ||
       !Number.isFinite(view.startedAt) ||
       view.startedAt <= 0
     )
       return null;
 
+    if (view.status === "queued") {
+      const order = saved.queueOrder;
+      return saved.finishedAt === null &&
+        typeof order === "number" &&
+        Number.isSafeInteger(order) &&
+        order > 0
+        ? saved
+        : null;
+    }
     if (view.status === "running" || view.status === "canceling") {
       return saved.finishedAt === null ? saved : null;
     }
@@ -202,24 +292,15 @@ async function readManifest(dir: string, id: string): Promise<SavedJob | null> {
       return null;
     if (
       view.status === "done" &&
-      (!videoFilename(view.filename) ||
-        !view.bytes ||
-        view.bytes < 0 ||
+      (!validOutputFilename(view.filename, view) ||
+        view.bytes === null ||
+        view.bytes < (file ? 0 : 1) ||
         !Number.isSafeInteger(view.bytes))
     )
       return null;
     return saved;
   } catch {
     return null;
-  }
-}
-
-function processIsAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -238,15 +319,18 @@ async function loadJobs() {
     const saved = await readManifest(dir, entry.name);
     if (!saved) continue;
     const job = createJob(saved, dir);
-    if (job.finishedAt === null) {
+    if (job.view.status === "queued") {
+      if (job.ownerPid !== process.pid && processIsAlive(job.ownerPid)) continue;
+      job.ownerPid = process.pid;
+      store.nextQueueOrder = Math.max(store.nextQueueOrder, job.queueOrder! + 1);
+    } else if (job.finishedAt === null) {
       if (processIsAlive(job.ownerPid)) continue;
       job.view = terminalView(job, "error", downloadMessages(job.locale).interrupted);
+      if (await hasCheckpoint(job)) job.view.resumable = true;
       job.finishedAt = Math.max(job.view.startedAt, Date.now());
       await persist(job).catch(() => undefined);
     }
-    if (job.view.status !== "done") {
-      await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
-    }
+    if (job.view.status !== "done" && !job.view.resumable) await discardFiles(job);
     store.jobs.set(entry.name, job);
   }
 }
@@ -257,7 +341,9 @@ async function pruneJobs() {
   for (const job of [...store.jobs.values()].sort(byRecency)) {
     if (job.finishedAt === null || store.active === job) continue;
     if (job.finishedAt >= cutoff && ++kept <= keepCount) continue;
-    if (await readManifest(job.dir, job.view.id)) {
+    const saved = await readManifest(job.dir, job.view.id);
+    if (job.finishedAt === null || store.jobs.get(job.view.id) !== job) continue;
+    if (saved) {
       try {
         await rm(job.dir, { recursive: true, force: true });
       } catch {
@@ -290,6 +376,7 @@ async function ready() {
   } else if (store.pruning) {
     await store.pruning;
   }
+  kickQueue();
 }
 
 function byRecency(a: Job, b: Job) {
@@ -301,6 +388,8 @@ type ResolvedTools = {
   prefix: string[];
   env: NodeJS.ProcessEnv;
   ffmpeg: string;
+  curl: string;
+  aria2: string | null;
   nodeBin: string | null;
   info: EngineInfo;
 };
@@ -335,25 +424,36 @@ async function inspectTools(): Promise<ResolvedTools> {
     const prefix = ["-m", "yt_dlp"];
     return { command, prefix, version: await checkVersion(command, prefix) };
   };
-  const [{ command, prefix, version }, ffmpeg] = await Promise.all([
+  const [{ command, prefix, version }, ffmpeg, curl, aria2] = await Promise.all([
     checkDownloader(),
     exec(tools.ffmpeg, ["-version"], options).then(
       () => true,
       () => false,
     ),
+    desktop ? checkVersion(tools.curl, ["--disable"]) : null,
+    desktop && tools.aria2 ? checkVersion(tools.aria2, ["--no-conf=true"]) : null,
   ]);
   return {
     command,
     prefix,
     env,
     ffmpeg: tools.ffmpeg,
+    curl: tools.curl,
+    aria2: aria2 ? tools.aria2 : null,
     nodeBin: tools.nodeBin,
-    info: { ytdlp: Boolean(version), ffmpeg, version },
+    info: {
+      ytdlp: Boolean(version),
+      ffmpeg,
+      version,
+      files: desktop,
+      curl: Boolean(curl),
+      aria2: Boolean(aria2),
+    },
   };
 }
 
-async function getTools() {
-  if (toolCache && Date.now() < toolCache.expiresAt) return toolCache.tools;
+export async function getTools(refresh = false) {
+  if (!refresh && toolCache && Date.now() < toolCache.expiresAt) return toolCache.tools;
   checkingTools ??= inspectTools()
     .then((tools) => {
       const ttl = tools.info.ytdlp && tools.info.ffmpeg ? 30_000 : 2000;
@@ -366,8 +466,8 @@ async function getTools() {
   return checkingTools;
 }
 
-export async function getEngineInfo(): Promise<EngineInfo> {
-  return (await getTools()).info;
+export async function getEngineInfo(refresh = false): Promise<EngineInfo> {
+  return (await getTools(refresh)).info;
 }
 
 function stopProcess(child: ChildProcess, signal: "SIGTERM" | "SIGKILL" = "SIGTERM") {
@@ -459,10 +559,13 @@ function recordLine(job: Job, line: string, stdout: boolean) {
 function explainFailure(job: Job): string {
   const messages = downloadMessages(job.locale);
   const detail = job.toolError;
+  if (job.view.file) return detail ?? messages.fileFailed;
   if (!detail) return messages.failed;
-  if (/sign in|login|confirm you.re not a bot/i.test(detail)) return messages.restricted;
+  if (/sign[ -]?in|log[ -]?in|confirm you.re not a bot/i.test(detail)) return messages.restricted;
   if (/unavailable|private video|removed/i.test(detail)) return messages.unavailable;
-  if (/requested format|no video formats/i.test(detail)) return messages.format;
+  if (/requested format|no video formats/i.test(detail)) {
+    return job.view.output === "mp3" ? messages.audioFormat : messages.format;
+  }
   return detail;
 }
 
@@ -471,14 +574,30 @@ async function inspectOutput(job: Job) {
   const outputDir = dataDir(job);
   const output = path.resolve(outputDir, job.outputs[0]!);
   const filename = path.basename(output);
-  if (path.relative(outputDir, path.dirname(output)) !== "" || !videoFilename(filename))
+  if (
+    path.relative(outputDir, path.dirname(output)) !== "" ||
+    !validOutputFilename(filename, job.view)
+  )
     return null;
   try {
     if (!(await lstat(outputDir)).isDirectory()) return null;
     const entries = await readdir(outputDir, { withFileTypes: true });
-    if (entries.length !== 1 || !entries[0]?.isFile()) return null;
+    const extras = entries.filter((entry) => entry.name !== filename);
+    if (
+      extras.some(
+        (entry) =>
+          !job.view.resumable || job.view.file || !entry.isFile() || !videoScratch(entry.name),
+      )
+    )
+      return null;
     const details = await lstat(output);
-    return details.isFile() && details.size > 0 ? { filename, bytes: details.size } : null;
+    if (!details.isFile() || (!job.view.file && details.size === 0)) return null;
+    await Promise.all(
+      extras.map(({ name }) =>
+        rm(path.join(outputDir, name), { force: true }).catch(() => undefined),
+      ),
+    );
+    return { filename, bytes: details.size };
   } catch {
     return null;
   }
@@ -534,8 +653,16 @@ async function finishJob(job: Job, code: number | null, signal: NodeJS.Signals |
 
   job.committing = true;
   const finishedAt = Math.max(job.view.startedAt, Date.now());
+  if (
+    view.status === "error" &&
+    !diskFull &&
+    (toolFailed || job.stopReason === "shutdown") &&
+    (await hasCheckpoint(job))
+  ) {
+    view.resumable = true;
+  }
   if (diskFull) {
-    await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
+    await discardFiles(job);
   }
   try {
     await persist(job, view, finishedAt);
@@ -544,20 +671,41 @@ async function finishJob(job: Job, code: number | null, signal: NodeJS.Signals |
       view = terminalView(job, "error", messages.storage);
   }
   if (view.status !== "done" && !diskFull) {
-    await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
+    if (!view.resumable) await discardFiles(job);
+    else if (job.view.file)
+      await rm(dataDir(job), { recursive: true, force: true }).catch(() => undefined);
+  } else if (view.status === "done" && job.view.file) {
+    await rm(transferDir(job), { recursive: true, force: true }).catch(() => undefined);
   }
   job.finishedAt = finishedAt;
   job.view = view;
   store.active = null;
 }
 
-function startDownloader(job: Job, tools: ResolvedTools) {
+function trackChild(job: Job, child: ChildProcess | null) {
+  if (!child && job.child && job.killTimer) {
+    clearTimeout(job.killTimer);
+    job.killTimer = null;
+    stopProcess(job.child, "SIGKILL");
+  }
+  job.child = child;
+}
+
+function runVideoDownload(job: Job, tools: ResolvedTools) {
   const outputDir = dataDir(job);
+  const { url, quality, output = "mp4" } = job.view;
   const child = spawn(
     tools.command,
     [
       ...tools.prefix,
-      ...youtubeArgs({ quality: job.view.quality, ffmpeg: tools.ffmpeg, nodeBin: tools.nodeBin }),
+      ...videoArgs({
+        url,
+        quality,
+        ffmpeg: tools.ffmpeg,
+        nodeBin: tools.nodeBin,
+        output,
+      }),
+      "--continue",
       "--no-simulate",
       "--progress",
       "--progress-template",
@@ -567,9 +715,9 @@ function startDownloader(job: Job, tools: ResolvedTools) {
       "-P",
       outputDir,
       "-o",
-      VIDEO_FILENAME,
+      videoFilename(output, quality),
       "--",
-      job.view.url,
+      url,
     ],
     {
       cwd: outputDir,
@@ -579,12 +727,76 @@ function startDownloader(job: Job, tools: ResolvedTools) {
       windowsHide: true,
     },
   );
-  job.child = child;
+  trackChild(job, child);
   watchLines(child.stdout, (line) => recordLine(job, line, true));
   watchLines(child.stderr, (line) => recordLine(job, line, false));
   child.once("error", () => {
     job.toolError = downloadMessages(job.locale).missingTools;
   });
+
+  return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("close", (code, signal) => {
+      trackChild(job, null);
+      resolve({ code, signal });
+    });
+  });
+}
+
+async function runFileDownload(job: Job, tools: ResolvedTools) {
+  const messages = downloadMessages(job.locale);
+  try {
+    const { filename, part } = await downloadDirectFile({
+      url: job.view.url,
+      directory: transferDir(job),
+      curl: tools.curl,
+      aria2: job.view.file === "aria2" ? tools.aria2 : null,
+      env: tools.env,
+      checkActive: () => {
+        if (job.stopReason) throw new Error("Download stopped");
+      },
+      onProcess: (child) => trackChild(job, child),
+      onProgress: ({ percent, speed, eta }) => {
+        if (job.view.status !== "running") return;
+        job.view = {
+          ...job.view,
+          percent: Math.min(99, percent),
+          speed: speed ?? null,
+          eta: eta ?? null,
+        };
+      },
+    });
+    if (!job.stopReason) {
+      await rename(part, path.join(dataDir(job), filename));
+      job.outputs.push(filename);
+    }
+    return { code: 0, signal: null };
+  } catch (cause) {
+    const error = cause as NodeJS.ErrnoException;
+    const failure = cause instanceof FileDownloadError ? cause.kind : null;
+    job.diskWriteFailed =
+      error.code === "ENOSPC" ||
+      error.code === "EDQUOT" ||
+      failure === "space" ||
+      (failure === "write" && (await diskIsLow(job.dir)));
+    job.toolError =
+      cause instanceof FileDownloadError
+        ? cause.kind === "webpage"
+          ? messages.fileWebpage
+          : cause.kind === "http" && cause.status
+            ? messages.fileHttp(cause.status)
+            : failure === "write"
+              ? messages.storage
+              : messages.fileFailed
+        : error.code === "ENOENT"
+          ? messages.missingCurl
+          : messages.fileFailed;
+    return { code: 1, signal: null };
+  }
+}
+
+function startDownloader(job: Job, tools: ResolvedTools) {
+  const outputDir = dataDir(job);
+  const transfer = job.view.file ? runFileDownload(job, tools) : runVideoDownload(job, tools);
 
   const storageCheck = desktop ? diskIsLow : previewIsOverSize;
   const storageLimitReason = desktop ? "space" : "size";
@@ -594,7 +806,7 @@ function startDownloader(job: Job, tools: ResolvedTools) {
     checking = true;
     try {
       const shouldStop = await storageCheck(outputDir);
-      if (shouldStop && job.child === child) stopJob(job, storageLimitReason);
+      if (shouldStop && store.active === job) stopJob(job, storageLimitReason);
     } finally {
       checking = false;
     }
@@ -604,41 +816,32 @@ function startDownloader(job: Job, tools: ResolvedTools) {
     : setTimeout(() => stopJob(job, "timeout"), 12 * 60 * 1000).unref();
   storageTimer.unref();
 
-  job.settled = new Promise<void>((resolve) => {
-    child.once("close", (code, signal) => {
+  job.settled = transfer
+    .then(async ({ code, signal }) => {
       clearInterval(storageTimer);
       if (timeTimer) clearTimeout(timeTimer);
-      if (job.killTimer) {
-        clearTimeout(job.killTimer);
-        stopProcess(child, "SIGKILL");
-      }
-      job.child = null;
-      void finishJob(job, code, signal).finally(() => {
-        resolve();
-        void schedulePrune();
-      });
+      await finishJob(job, code, signal);
+    })
+    .finally(() => {
+      void schedulePrune();
+      kickQueue();
     });
-  });
 }
 
-async function launch(url: string, quality: JobView["quality"], locale: Locale) {
-  const messages = downloadMessages(locale);
-  const tools = await getTools();
-  if (!tools.info.ytdlp || !tools.info.ffmpeg) {
-    throw new DownloadError(messages.missingTools, 503);
-  }
+function newJob(url: string, settings: Settings, locale: Locale, queueOrder?: number) {
   const id = randomUUID();
-  const job = createJob(
+  return createJob(
     {
       schema: 1,
       ownerPid: process.pid,
       finishedAt: null,
+      queueOrder,
       locale,
       view: {
         id,
         url,
-        quality,
-        status: "running",
+        ...settings,
+        status: queueOrder === undefined ? "running" : "queued",
         percent: null,
         speed: null,
         eta: null,
@@ -650,47 +853,252 @@ async function launch(url: string, quality: JobView["quality"], locale: Locale) 
     },
     path.join(root, id),
   );
+}
+
+function requireOpen(locale: Locale) {
+  if (store.shuttingDown) throw new DownloadError(downloadMessages(locale).closing, 503);
+}
+
+function requireTools(tools: ResolvedTools, locale: Locale, file?: FileDownloader) {
+  if (file) {
+    if (!tools.info.curl) throw new DownloadError(downloadMessages(locale).missingCurl, 503);
+    return;
+  }
+  if (!tools.info.ytdlp || !tools.info.ffmpeg) {
+    throw new DownloadError(downloadMessages(locale).missingTools, 503);
+  }
+}
+
+function asStorageError(error: unknown, locale: Locale) {
+  if (error instanceof DownloadError) return error;
+  const messages = downloadMessages(locale);
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return desktop && (code === "ENOSPC" || code === "EDQUOT")
+    ? new DownloadError(messages.space, 507)
+    : new DownloadError(messages.storage, 500);
+}
+
+async function prepareFiles(job: Job) {
+  const staging = dataDir(job);
+  await mkdir(staging, { mode: 0o700, recursive: true });
+  if (!(await lstat(staging)).isDirectory()) throw new Error("Invalid download directory");
+  if (desktop && (await diskIsLow(staging))) {
+    throw new DownloadError(downloadMessages(job.locale).space, 507);
+  }
+}
+
+async function launch(normalized: string, settings: Settings, locale: Locale) {
+  const [url, tools] = await Promise.all([
+    settings.file ? normalized : resolveVideoUrl(normalized),
+    getTools(),
+  ]);
+  if (!url) throw new DownloadError(downloadMessages(locale).shortLink, 422);
+  requireTools(tools, locale, settings.file);
+  requireOpen(locale);
+  const job = newJob(url, settings, locale);
 
   let created = false;
   try {
-    await ready();
     await mkdir(root, { recursive: true, mode: 0o700 });
     await mkdir(job.dir, { mode: 0o700 });
     created = true;
-    await mkdir(dataDir(job), { mode: 0o700 });
-    if (desktop && (await diskIsLow(dataDir(job)))) throw new DownloadError(messages.space, 507);
+    await prepareFiles(job);
     await persist(job);
-    if (store.shuttingDown) throw new DownloadError(messages.closing, 503);
+    requireOpen(locale);
     startDownloader(job, tools);
   } catch (error) {
     if (created) await rm(job.dir, { recursive: true, force: true }).catch(() => undefined);
-    if (error instanceof DownloadError) throw error;
-    const code = (error as NodeJS.ErrnoException).code;
-    if (desktop && (code === "ENOSPC" || code === "EDQUOT")) {
-      throw new DownloadError(messages.space, 507);
-    }
-    throw new DownloadError(messages.storage, 500);
+    throw asStorageError(error, locale);
   }
 
   store.active = job;
-  store.jobs.set(id, job);
+  store.jobs.set(job.view.id, job);
   return job.view;
 }
 
-export async function startJob(input: { url?: unknown; quality?: unknown; lang?: unknown }) {
+function mutate<T>(update: () => Promise<T>) {
+  const completed = store.mutations.then(update);
+  store.mutations = completed.then(
+    () => undefined,
+    () => undefined,
+  );
+  return completed;
+}
+
+function queuedJobs() {
+  return [...store.jobs.values()]
+    .filter((job) => job.view.status === "queued")
+    .sort((a, b) => a.queueOrder! - b.queueOrder!);
+}
+
+async function launchQueued(job: Job) {
+  try {
+    const [url, tools] = await Promise.all([
+      job.view.file ? job.view.url : resolveVideoUrl(job.view.url),
+      getTools(),
+    ]);
+    if (store.shuttingDown || job.stopReason === "cancel") return;
+    if (!url) throw new DownloadError(downloadMessages(job.locale).shortLink, 422);
+    requireTools(tools, job.locale, job.view.file);
+    await prepareFiles(job);
+    if (!store.shuttingDown && job.stopReason === null) {
+      const running: JobView = { ...job.view, url, status: "running" };
+      await persist(job, running);
+      if (!store.shuttingDown && job.stopReason === null) {
+        job.view = running;
+        startDownloader(job, tools);
+        store.active = job;
+        return;
+      }
+      // A cancellation or shutdown reached the job before its process spawned.
+      await persist(job);
+    }
+    if (!job.view.resumable) await discardFiles(job);
+  } catch (error) {
+    if (job.stopReason === "cancel") return;
+    const failure = asStorageError(error, job.locale);
+    const view = terminalView(job, "error", failure.message);
+    if (failure.status !== 507 && (await hasCheckpoint(job))) view.resumable = true;
+    else await discardFiles(job);
+    const finishedAt = Math.max(job.view.startedAt, Date.now());
+    await persist(job, view, finishedAt).catch(() => undefined);
+    job.view = view;
+    job.finishedAt = finishedAt;
+    void schedulePrune();
+  }
+}
+
+function kickQueue() {
+  if (store.shuttingDown || store.pending || store.active || store.pump || !queuedJobs().length) {
+    return;
+  }
+  store.pump = mutate(async () => {
+    if (store.shuttingDown || store.pending || store.active) return;
+    const [next] = queuedJobs();
+    if (next) await launchQueued(next);
+  }).finally(() => {
+    store.pump = null;
+    kickQueue();
+  });
+}
+
+function downloadSettings(qualityValue: unknown, outputValue: unknown, locale: Locale) {
+  const messages = downloadMessages(locale);
+  const output = outputValue === undefined ? "mp4" : outputValue;
+  if (!isOutput(output)) throw new DownloadError(messages.badOutput, 400);
+  const quality = output === "mp3" ? "best" : qualityValue;
+  if (!isQuality(quality)) throw new DownloadError(messages.badQuality, 400);
+  return { output, quality };
+}
+
+function normalizeRequestUrl(raw: unknown, locale: Locale) {
+  const video = normalizeVideoUrl(raw);
+  if (video) return { url: video, file: false };
+  if (desktop) {
+    const file = normalizeFileUrl(raw);
+    if (file) return { url: file, file: true };
+  }
+  const messages = downloadMessages(locale);
+  throw new DownloadError(desktop ? messages.badDownloadUrl : messages.badUrl, 400);
+}
+
+function fileSettings(accelerate: unknown, locale: Locale): Settings {
+  if (accelerate !== undefined && typeof accelerate !== "boolean") {
+    throw new DownloadError(downloadMessages(locale).badAcceleration, 400);
+  }
+  return { quality: "best", file: accelerate ? "aria2" : "curl" };
+}
+
+function requireCapacity(count: number, locale: Locale) {
+  if (queuedJobs().length + Number(store.active !== null) + count > queueLimit) {
+    throw new DownloadError(downloadMessages(locale).queueFull(queueLimit), 409);
+  }
+}
+
+async function acceptQueued(
+  requests: { url: string; settings: Settings; retryOf?: string }[],
+  locale: Locale,
+) {
+  requireOpen(locale);
+  const jobs = requests.map(({ url, settings, retryOf }) => {
+    const job = newJob(url, settings, locale, store.nextQueueOrder++);
+    if (retryOf) job.view.retryOf = retryOf;
+    return job;
+  });
+  const created = [];
+  try {
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    for (const job of jobs) {
+      await mkdir(job.dir, { mode: 0o700 });
+      created.push(job.dir);
+      await persist(job);
+    }
+  } catch (error) {
+    await Promise.all(
+      created.map((dir) => rm(dir, { recursive: true, force: true }).catch(() => undefined)),
+    );
+    throw asStorageError(error, locale);
+  }
+
+  for (const job of jobs) store.jobs.set(job.view.id, job);
+  kickQueue();
+  return jobs.map((job) => job.view);
+}
+
+export async function enqueueJobs(input: {
+  urls?: unknown;
+  quality?: unknown;
+  output?: unknown;
+  accelerate?: unknown;
+  lang?: unknown;
+}) {
   const locale = parseLocale(input.lang);
   const messages = downloadMessages(locale);
-  const url = typeof input.url === "string" ? normalizeYouTubeUrl(input.url) : null;
-  if (!url) throw new DownloadError(messages.badUrl, 400);
-  if (!isQuality(input.quality)) throw new DownloadError(messages.badQuality, 400);
-  if (store.shuttingDown) throw new DownloadError(messages.closing, 503);
+  if (!Array.isArray(input.urls) || !input.urls.length || input.urls.length > MAX_BATCH_URLS) {
+    throw new DownloadError(messages.badBatch(MAX_BATCH_URLS), 400);
+  }
+  const normalized = input.urls.map((raw) => normalizeRequestUrl(raw, locale));
+  const files = fileSettings(input.accelerate, locale);
+  const videos = normalized.some((item) => !item.file)
+    ? downloadSettings(input.quality === undefined ? "best" : input.quality, input.output, locale)
+    : files;
+  const requests = normalized.map(({ url, file }) => ({ url, settings: file ? files : videos }));
+  requireOpen(locale);
+  return mutate(async () => {
+    await ready();
+    requireOpen(locale);
+    requireCapacity(normalized.length, locale);
+    return acceptQueued(requests, locale);
+  });
+}
+
+export async function startJob(input: {
+  url?: unknown;
+  quality?: unknown;
+  output?: unknown;
+  accelerate?: unknown;
+  lang?: unknown;
+}) {
+  const locale = parseLocale(input.lang);
+  const messages = downloadMessages(locale);
+  const { url, file } = normalizeRequestUrl(input.url, locale);
+  const settings = file
+    ? fileSettings(input.accelerate, locale)
+    : downloadSettings(input.quality, input.output, locale);
+  requireOpen(locale);
   if (store.pending || store.active) throw new DownloadError(messages.busy, 409);
 
-  store.pending = launch(url, input.quality, locale);
+  store.pending = mutate(async () => {
+    await ready();
+    requireOpen(locale);
+    if (queuedJobs().length) throw new DownloadError(messages.busy, 409);
+    return launch(url, settings, locale);
+  });
   try {
     return await store.pending;
   } finally {
     store.pending = null;
+    kickQueue();
   }
 }
 
@@ -702,9 +1110,10 @@ export async function listJobs(): Promise<JobView[]> {
   await ready();
   let finished = 0;
   const recent = [...store.jobs.values()]
+    .filter((job) => job.view.status !== "queued")
     .sort(byRecency)
     .filter((job) => !hasExpired(job) && (job.finishedAt === null || ++finished <= keepCount));
-  return Promise.all(recent.map(currentView));
+  return Promise.all([...recent, ...queuedJobs()].map(currentView));
 }
 
 async function findJob(id: string) {
@@ -722,14 +1131,91 @@ export async function getJob(id: string) {
 export async function cancelJob(id: string) {
   const job = await findJob(id);
   if (!job) return null;
+  if (job.view.status === "queued") {
+    job.stopReason = "cancel";
+    return mutate(async () => {
+      if (job.view.status === "queued") {
+        const view = terminalView(job, "canceled", null);
+        const finishedAt = Math.max(job.view.startedAt, Date.now());
+        try {
+          await persist(job, view, finishedAt);
+          job.finishedAt = finishedAt;
+          job.view = view;
+          await discardFiles(job);
+          void schedulePrune();
+        } finally {
+          job.stopReason = null;
+          kickQueue();
+        }
+      } else if (!job.committing) {
+        stopJob(job, "cancel");
+      }
+      return currentView(job);
+    });
+  }
   if (job.committing) await job.settled;
   else stopJob(job, "cancel");
   return currentView(job);
 }
 
+export async function retryJob(id: string, lang?: unknown) {
+  const locale = parseLocale(lang);
+  requireOpen(locale);
+  return mutate(async () => {
+    const original = await findJob(id);
+    if (!original) return null;
+    const status = (await currentView(original)).status;
+    if (status !== "error" && status !== "canceled") {
+      throw new DownloadError(downloadMessages(locale).cannotRetry, 409);
+    }
+    const retryOf = original.view.retryOf ?? id;
+    const activeRetry = [...store.jobs.values()].find(
+      (job) => job.finishedAt === null && (job.view.retryOf ?? job.view.id) === retryOf,
+    );
+    if (activeRetry) return activeRetry.view;
+    requireCapacity(1, locale);
+    if (status === "error" && original.view.resumable) {
+      const finishedAt = original.finishedAt;
+      // The expiry sweep must leave this directory alone while it is requeued.
+      original.finishedAt = null;
+      try {
+        if (await hasCheckpoint(original)) {
+          const view: JobView = {
+            ...original.view,
+            status: "queued",
+            startedAt: Date.now(),
+            error: null,
+          };
+          const resumed = createJob(
+            {
+              schema: 1,
+              ownerPid: process.pid,
+              locale,
+              finishedAt: null,
+              queueOrder: store.nextQueueOrder++,
+              view,
+            },
+            original.dir,
+          );
+          await persist(resumed);
+          store.jobs.set(id, resumed);
+          kickQueue();
+          return view;
+        }
+      } finally {
+        original.finishedAt = finishedAt;
+      }
+    }
+    const { url, quality, output, file } = original.view;
+    const settings = file ? { file, quality } : { quality, output: output ?? "mp4" };
+    const [retried] = await acceptQueued([{ url, settings, retryOf }], locale);
+    return retried;
+  });
+}
+
 async function locateFile(job: Job) {
   const { filename, status, bytes } = job.view;
-  if (status !== "done" || !videoFilename(filename) || !bytes) return null;
+  if (status !== "done" || !validOutputFilename(filename, job.view) || bytes === null) return null;
   const dir = dataDir(job);
   try {
     if (!(await lstat(job.dir)).isDirectory() || !(await lstat(dir)).isDirectory()) return null;
@@ -750,6 +1236,8 @@ async function currentView(job: Job) {
 
 function contentType(filename: string) {
   switch (path.extname(filename).toLowerCase()) {
+    case ".mp3":
+      return "audio/mpeg";
     case ".mp4":
     case ".m4v":
       return "video/mp4";
@@ -765,7 +1253,8 @@ function contentType(filename: string) {
 export async function openJobFile(id: string, locale: Locale = "zh"): Promise<Response> {
   const missing = () => jobJson({ error: downloadMessages(locale).missingFile }, 404);
   const job = await findJob(id);
-  const output = job ? await locateFile(job) : null;
+  if (!job) return missing();
+  const output = await locateFile(job);
   if (!output) return missing();
   const { filename, filePath, bytes } = output;
   try {
@@ -784,7 +1273,7 @@ export async function openJobFile(id: string, locale: Locale = "zh"): Promise<Re
       const body = Readable.toWeb(file.createReadStream()) as ReadableStream<Uint8Array>;
       return new Response(body, {
         headers: {
-          "content-type": contentType(filename),
+          "content-type": job.view.file ? "application/octet-stream" : contentType(filename),
           "content-length": String(details.size),
           "content-disposition": `attachment; filename="${printable}"; filename*=UTF-8''${encoded}`,
           "cache-control": "no-store",
@@ -802,7 +1291,7 @@ export async function openJobFile(id: string, locale: Locale = "zh"): Promise<Re
 
 export async function shutdownDownloads() {
   store.shuttingDown = true;
-  await store.pending?.catch(() => undefined);
+  await store.mutations;
   const job = store.active;
   if (!job) return;
   stopJob(job, "shutdown");

@@ -2,7 +2,7 @@
   "name": "luopian",
   "private": true,
   "version": "1.0.0",
-  "description": "落片 — YouTube video downloader",
+  "description": "落片 — YouTube and Bilibili video downloader",
   "author": "Luopian",
   "type": "module",
   "main": "main.mjs"

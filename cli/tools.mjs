@@ -107,9 +107,11 @@ function toolOverride(value) {
 export function resolveTools() {
   const ffmpeg = toolOverride(process.env.LUOPIAN_FFMPEG) ?? findTool("ffmpeg") ?? "ffmpeg";
   const ytdlp = toolOverride(process.env.LUOPIAN_YTDLP) ?? findTool("yt-dlp") ?? "yt-dlp";
+  const curl = toolOverride(process.env.LUOPIAN_CURL) ?? findTool("curl") ?? "curl";
+  const aria2 = toolOverride(process.env.LUOPIAN_ARIA2) ?? findTool("aria2c");
   const nodeBin = resolveNodeBin();
   const outDir = process.env.LUOPIAN_OUT || path.join(os.homedir(), "Downloads");
-  return { ffmpeg, ytdlp, nodeBin, outDir };
+  return { ffmpeg, ytdlp, curl, aria2, nodeBin, outDir };
 }
 
 /** @param {NodeJS.ProcessEnv} [extra] */

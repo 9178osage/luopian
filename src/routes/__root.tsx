@@ -5,6 +5,8 @@ import { LocaleProvider } from "@/components/locale-provider";
 import { AuthProvider } from "@/lib/auth/provider";
 import appCss from "../styles.css?url";
 
+const desktopBuild = import.meta.env.MODE === "desktop";
+
 export const Route = createRootRoute({
   head: () => ({
     meta: [
@@ -13,15 +15,19 @@ export const Route = createRootRoute({
       { title: "落片" },
       {
         name: "description",
-        content: "贴上 YouTube 视频链接，选择画质并下载。",
+        content: "贴上 YouTube 或哔哩哔哩视频链接，保存为 MP4 或 MP3。",
       },
       { name: "theme-color", content: "#11131a" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
       { rel: "stylesheet", href: appCss },
-      { rel: "manifest", href: "/__grok/manifest.webmanifest" },
-      { rel: "apple-touch-icon", href: "/__grok/icon-180.png" },
+      ...(desktopBuild
+        ? []
+        : [
+            { rel: "manifest", href: "/__grok/manifest.webmanifest" },
+            { rel: "apple-touch-icon", href: "/__grok/icon-180.png" },
+          ]),
     ],
   }),
   component: () => (
@@ -30,7 +36,7 @@ export const Route = createRootRoute({
         <HeadContent />
       </head>
       <body>
-        <PreviewHostBridge />
+        {!desktopBuild && <PreviewHostBridge />}
         <LocaleProvider>
           <AuthProvider>
             <Outlet />

@@ -4,7 +4,19 @@ import type { JobView } from "@/lib/downloader/types";
 import type { Locale } from "@/lib/i18n";
 
 export function isActive(job: JobView) {
-  return job.status === "running" || job.status === "canceling";
+  return job.status === "queued" || job.status === "running" || job.status === "canceling";
+}
+
+function orderJobs(jobs: JobView[]) {
+  function rank(job: JobView) {
+    if (job.status === "running" || job.status === "canceling") return 0;
+    return job.status === "queued" ? 1 : 2;
+  }
+  return jobs.sort((first, second) => {
+    const firstRank = rank(first);
+    const difference = firstRank - rank(second);
+    return difference || (firstRank === 2 ? second.startedAt - first.startedAt : 0);
+  });
 }
 
 export function useDownloads(locale: Locale) {
@@ -32,7 +44,7 @@ export function useDownloads(locale: Locale) {
         if (!response.ok) throw new Error(String(response.status));
         const next: JobView[] = await response.json();
         if (signal.aborted) return;
-        setJobs(next);
+        setJobs(orderJobs(next));
         setConnection("ready");
         retryDelay = 1000;
         delay = next.some(isActive) ? 950 : 4000;
@@ -55,14 +67,14 @@ export function useDownloads(locale: Locale) {
     };
   }, [locale, revision]);
 
-  function refresh(job?: JobView) {
+  function refresh(updates: JobView[] = []) {
     currentPoll.current?.abort();
-    if (job) {
-      setJobs((current) =>
-        [job, ...current.filter((entry) => entry.id !== job.id)].sort(
-          (first, second) => second.startedAt - first.startedAt,
-        ),
-      );
+    if (updates.length) {
+      setJobs((current) => {
+        const byId = new Map(current.map((job) => [job.id, job]));
+        for (const job of updates) byId.set(job.id, job);
+        return orderJobs([...byId.values()]);
+      });
     }
     setRevision((value) => value + 1);
   }

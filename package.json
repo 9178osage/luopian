@@ -17,13 +17,14 @@
     "preview:stop": "node scripts/preview.mjs stop",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --experimental-strip-types --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts",
+    "test": "node --experimental-strip-types --test \"scripts/**/*.test.mjs\" && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "electron:dev": "npm run build:desktop && electron .",
     "electron:start": "electron .",
     "mac:tools": "sh scripts/mac-setup-tools.sh",
-    "dist:mac": "npm run build:desktop && electron-builder --mac dmg dir",
+    "dist:mac": "sh scripts/mac-package.sh local",
+    "dist:mac:release": "sh scripts/mac-package.sh release",
     "cli": "node bin/luopian.mjs",
     "cli:doctor": "node bin/luopian.mjs doctor",
     "cli:link": "npm link",
@@ -106,7 +107,7 @@
     "electron-builder": "^26.0.12"
   },
   "productName": "落片",
-  "description": "落片 — download individual YouTube videos from the terminal or desktop",
+  "description": "落片 — download individual YouTube or Bilibili videos from the terminal or desktop",
   "main": "electron/main.mjs",
   "build": {
     "appId": "com.luopian.app",
@@ -117,6 +118,7 @@
       "output": "release"
     },
     "beforeBuild": "./scripts/desktop-before-build.cjs",
+    "afterPack": "./scripts/desktop-after-pack.cjs",
     "files": [
       "*.mjs",
       "*.cjs",
@@ -133,8 +135,7 @@
       "target": [
         "dmg",
         "dir"
-      ],
-      "identity": null
+      ]
     },
     "dmg": {
       "title": "落片"

@@ -2,10 +2,16 @@ import { createFileRoute } from "@tanstack/react-router";
 
 import { parseLocale } from "@/lib/i18n";
 import { downloadMessages } from "@/lib/downloader/messages";
-import { guardStudioMutation, jobJson, readDownloadRequest } from "@/lib/downloader/request-guard";
+import {
+  desktopDownloads,
+  guardStudioMutation,
+  jobJson,
+  readDownloadRequest,
+} from "@/lib/downloader/request-guard";
 
 export const Route = createFileRoute("/api/jobs")({
   server: {
+    middleware: [desktopDownloads],
     handlers: {
       GET: async ({ request }) => {
         const locale = parseLocale(new URL(request.url).searchParams.get("lang"));
@@ -23,13 +29,22 @@ export const Route = createFileRoute("/api/jobs")({
         if (input instanceof Response) return input;
         const body =
           input && typeof input === "object"
-            ? (input as { url?: unknown; quality?: unknown; lang?: unknown })
+            ? (input as {
+                url?: unknown;
+                urls?: unknown;
+                quality?: unknown;
+                output?: unknown;
+                accelerate?: unknown;
+                lang?: unknown;
+              })
             : {};
         const locale = parseLocale(body.lang ?? new URL(request.url).searchParams.get("lang"));
-        const { DownloadError, startJob } = await import("@/lib/downloader/engine.server");
+        const { DownloadError, enqueueJobs, startJob } =
+          await import("@/lib/downloader/engine.server");
+        const options = { ...body, lang: locale };
         try {
           return jobJson(
-            await startJob({ url: body.url, quality: body.quality, lang: locale }),
+            body.urls === undefined ? await startJob(options) : await enqueueJobs(options),
             201,
           );
         } catch (error) {

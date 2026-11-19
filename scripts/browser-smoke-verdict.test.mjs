@@ -371,6 +371,14 @@ test("exitCodeFor: no viewport data is a failure", () => {
   assert.equal(exitCodeFor(undefined), 1);
 });
 
+test("exitCodeFor: empty content, overflow, and baseline differences fail the run", () => {
+  assert.equal(exitCodeFor(verdict({ bodyTextLen: 0 }).viewports), 3);
+  assert.equal(exitCodeFor(verdict({}, { horizontalOverflow: true }).viewports), 3);
+  assert.equal(exitCodeFor(verdict().viewports, true), 3);
+  assert.equal(exitCodeFor(verdict({ bodyTextLen: 0, hasCanvas: true }).viewports), 0);
+  assert.equal(exitCodeFor(verdict({ bodyTextLen: 0, hasVisibleMedia: true }).viewports), 0);
+});
+
 test("browser-smoke wires the guard and verdict helpers", () => {
   const src = readFileSync(join(TEMPLATE_ROOT, "scripts/browser-smoke.mjs"), "utf8");
   assert.match(src, /from "\.\/browser-guard\.mjs"/);
@@ -385,7 +393,7 @@ test("browser-smoke wires the guard and verdict helpers", () => {
   assert.match(src, /normalizedBodyTextHash\(/);
   assert.match(src, /bodyTextPrefix\(/);
   assert.match(src, /baselineComparison\(/);
-  assert.match(src, /process\.exitCode = exitCodeFor\(viewports\)/);
+  assert.match(src, /exitCodeFor\(viewports, verdict\.divergesFromBaseline\)/);
   assert.match(src, /waitUntil: "domcontentloaded"/);
   assert.doesNotMatch(
     src,

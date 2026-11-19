@@ -59,7 +59,8 @@ test(
       `
 globalThis[Symbol.for("luopian.shutdownDownloads")] = async () => process.send("downloads stopped");
 export async function middleware(request, response) {
-  response.end(JSON.stringify(request.headers));
+  const nonce = globalThis[Symbol.for("luopian.desktopRequest")].getStore();
+  response.end(JSON.stringify({ headers: request.headers, nonce }));
 }
 `,
     );
@@ -75,10 +76,18 @@ export async function middleware(request, response) {
       headers: { "X-Luopian-Desktop": token, "X-Forwarded-Host": "unused.invalid" },
     });
     assert.equal(response.status, 200);
-    const headers = await response.json();
+    const { headers, nonce } = await response.json();
     assert.equal(headers.host, `127.0.0.1:${readiness.port}`);
     assert.equal(headers["x-luopian-desktop"], undefined);
     assert.equal(headers["x-forwarded-host"], undefined);
+    assert.match(nonce, /^[A-Za-z0-9+/]{24}$/);
+    assert.ok(
+      response.headers
+        .get("content-security-policy")
+        ?.includes("script-src 'self' 'nonce-" + nonce + "'"),
+    );
+    const next = await fetch(url, { headers: { "X-Luopian-Desktop": token } });
+    assert.notEqual((await next.json()).nonce, nonce);
 
     const shutdown = once(child, "message");
     child.send({ type: "shutdown" });

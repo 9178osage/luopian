@@ -115,7 +115,14 @@ try {
     await page.waitForTimeout(1000);
 
     const title = await page.title();
-    const hasCanvas = (await page.locator("canvas").count()) > 0;
+    const hasCanvas = await page.locator("canvas:visible").first().isVisible();
+    const hasVisibleMedia = await page
+      .locator("img:visible, svg:visible, video:visible")
+      .evaluateAll((elements) =>
+        elements.some(
+          (element) => !(element instanceof HTMLImageElement) || element.naturalWidth > 0,
+        ),
+      );
     const bodyText = await page
       .locator("body")
       .innerText()
@@ -133,6 +140,7 @@ try {
       status,
       title,
       hasCanvas,
+      hasVisibleMedia,
       bodyTextLen: normalizeBodyText(bodyText).length,
       bodyTextHash: normalizedBodyTextHash(bodyText),
       bodyTextPrefix: bodyTextPrefix(bodyText),
@@ -159,13 +167,15 @@ try {
     verdict.baselineReasons = reasons;
   }
 
+  const code = exitCodeFor(viewports, verdict.divergesFromBaseline);
+  verdict.ok = code === 0;
   writeFileSync(outJson, JSON.stringify(verdict, null, 2));
   console.log(JSON.stringify(verdict, null, 2));
   for (const w of [...brandWarnings, ...authWarnings]) console.error(w);
   // Set the code rather than aborting the process so the `finally` browser
   // teardown always runs (agents typically smoke twice per turn; leaking
   // Chromium accumulates across retries).
-  process.exitCode = exitCodeFor(viewports);
+  process.exitCode = code;
 } catch (err) {
   const failure = { ok: false, url, error: String(err?.message || err) };
   try {
