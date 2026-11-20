@@ -34,10 +34,8 @@ export const Route = createFileRoute("/api/jobs/$jobId")({
         if (guarded) return guarded;
         const input = await readDownloadRequest(request);
         if (input instanceof Response) return input;
-        const body = input && typeof input === "object" ? (input as { lang?: unknown }) : null;
-        const locale = parseLocale(body?.lang ?? new URL(request.url).searchParams.get("lang"));
+        const locale = parseLocale(input.lang ?? new URL(request.url).searchParams.get("lang"));
         const messages = downloadMessages(locale);
-        if (!body || Array.isArray(body)) return jobJson({ error: messages.invalidJson }, 400);
         if (!JOB_ID.test(params.jobId)) return jobJson({ error: messages.missingJob }, 404);
         const { DownloadError, retryJob } = await import("@/lib/downloader/engine.server");
         try {

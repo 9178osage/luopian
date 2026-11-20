@@ -28,6 +28,7 @@ import {
 import {
   isOutput,
   isQuality,
+  isVideoScratch,
   MAX_BATCH_URLS,
   normalizeFileUrl,
   normalizeVideoUrl,
@@ -99,6 +100,7 @@ type Store = {
   active: Job | null;
   loading: Promise<void> | null;
   pruning: Promise<void> | null;
+  pruneTimer: NodeJS.Timeout | null;
   mutations: Promise<void>;
   pump: Promise<void> | null;
   nextQueueOrder: number;
@@ -111,6 +113,7 @@ const store = ((globalThis as typeof globalThis & { __luopianVideo?: Store }).__
   active: null,
   loading: null,
   pruning: null,
+  pruneTimer: null,
   mutations: Promise.resolve(),
   pump: null,
   nextQueueOrder: 1,
@@ -119,6 +122,7 @@ const store = ((globalThis as typeof globalThis & { __luopianVideo?: Store }).__
 // Vite can retain an older queue in the same process while reloading this module.
 store.mutations ??= Promise.resolve();
 store.pump ??= null;
+store.pruneTimer ??= null;
 store.nextQueueOrder ??=
   1 + Math.max(0, ...Array.from(store.jobs.values(), (job) => job.queueOrder ?? 0));
 
@@ -161,10 +165,6 @@ async function discardFiles(job: Job) {
   );
 }
 
-function videoScratch(name: string) {
-  return /(?:\.part(?:-Frag\d+)?|\.ytdl|\.f\d+[\w.-]*\.[a-z0-9]+)$/i.test(name);
-}
-
 async function hasCheckpoint(job: Job) {
   if (!desktop) return false;
   try {
@@ -174,7 +174,7 @@ async function hasCheckpoint(job: Job) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       if (
         entry.isFile() &&
-        videoScratch(entry.name) &&
+        isVideoScratch(entry.name) &&
         (await lstat(path.join(directory, entry.name))).size > 0
       )
         return true;
@@ -238,6 +238,32 @@ async function persist(job: Job, view = job.view, finishedAt = job.finishedAt) {
   }
 }
 
+function nullable<T>(value: unknown, check: (value: unknown) => value is T) {
+  return value === null || check(value);
+}
+
+const isText = (value: unknown): value is string => typeof value === "string";
+
+// Every field rendered by the download list must have its declared type, or one
+// damaged manifest could break the whole page.
+function validViewFields(view: JobView) {
+  return (
+    ["queued", "running", "canceling", "done", "error", "canceled"].includes(view.status) &&
+    nullable(
+      view.percent,
+      (value): value is number => typeof value === "number" && value >= 0 && value <= 100,
+    ) &&
+    nullable(view.speed, isText) &&
+    nullable(view.eta, isText) &&
+    nullable(view.filename, isText) &&
+    nullable(view.error, isText) &&
+    nullable(
+      view.bytes,
+      (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
+    )
+  );
+}
+
 async function readManifest(dir: string, id: string): Promise<SavedJob | null> {
   if (!JOB_ID.test(id)) return null;
   try {
@@ -254,7 +280,9 @@ async function readManifest(dir: string, id: string): Promise<SavedJob | null> {
       saved.ownerPid <= 0 ||
       !["zh", "en"].includes(saved.locale) ||
       view?.id !== id ||
+      typeof view.url !== "string" ||
       !view.url ||
+      !validViewFields(view) ||
       (file === undefined
         ? normalizeVideoUrl(view.url) !== view.url
         : !desktop ||
@@ -358,8 +386,32 @@ async function pruneJobs() {
 function schedulePrune() {
   store.pruning ??= pruneJobs().finally(() => {
     store.pruning = null;
+    armPruneTimer();
   });
   return store.pruning;
+}
+
+// Expired folders are removed on time even when no window is polling the service.
+function armPruneTimer() {
+  if (store.pruneTimer) clearTimeout(store.pruneTimer);
+  store.pruneTimer = null;
+  if (store.shuttingDown) return;
+  let next = Infinity;
+  for (const job of store.jobs.values()) {
+    if (job.finishedAt !== null) next = Math.min(next, job.finishedAt + keepFor);
+  }
+  if (next === Infinity) return;
+  const now = Date.now();
+  // A folder that could not be removed yet (Windows file locks) is retried once a minute.
+  const delay = next > now ? next - now + 1000 : 60_000;
+  store.pruneTimer = setTimeout(
+    () => {
+      store.pruneTimer = null;
+      void schedulePrune();
+    },
+    Math.min(delay, 2 ** 31 - 1),
+  );
+  store.pruneTimer.unref();
 }
 
 let lastSweep = 0;
@@ -586,7 +638,7 @@ async function inspectOutput(job: Job) {
     if (
       extras.some(
         (entry) =>
-          !job.view.resumable || job.view.file || !entry.isFile() || !videoScratch(entry.name),
+          !job.view.resumable || job.view.file || !entry.isFile() || !isVideoScratch(entry.name),
       )
     )
       return null;
@@ -1135,16 +1187,19 @@ export async function cancelJob(id: string) {
     job.stopReason = "cancel";
     return mutate(async () => {
       if (job.view.status === "queued") {
-        const view = terminalView(job, "canceled", null);
-        const finishedAt = Math.max(job.view.startedAt, Date.now());
+        // Leave the queue in memory first, so a failed write can never let this job start.
+        job.view = terminalView(job, "canceled", null);
+        job.finishedAt = Math.max(job.view.startedAt, Date.now());
         try {
-          await persist(job, view, finishedAt);
-          job.finishedAt = finishedAt;
-          job.view = view;
+          await persist(job);
           await discardFiles(job);
-          void schedulePrune();
+        } catch (error) {
+          // Without its manifest, a restart cannot pick the job up again either.
+          await rm(job.dir, { recursive: true, force: true }).catch(() => {
+            throw asStorageError(error, job.locale);
+          });
         } finally {
-          job.stopReason = null;
+          void schedulePrune();
           kickQueue();
         }
       } else if (!job.committing) {
@@ -1291,6 +1346,8 @@ export async function openJobFile(id: string, locale: Locale = "zh"): Promise<Re
 
 export async function shutdownDownloads() {
   store.shuttingDown = true;
+  if (store.pruneTimer) clearTimeout(store.pruneTimer);
+  store.pruneTimer = null;
   await store.mutations;
   const job = store.active;
   if (!job) return;

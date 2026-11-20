@@ -17,8 +17,7 @@ export const Route = createFileRoute("/api/probe")({
         if (guarded) return guarded;
         const input = await readDownloadRequest(request);
         if (input instanceof Response) return input;
-        const body =
-          input && typeof input === "object" ? (input as { url?: unknown; lang?: unknown }) : {};
+        const body: { url?: unknown; lang?: unknown } = input;
         const locale = parseLocale(body.lang ?? new URL(request.url).searchParams.get("lang"));
         const { DownloadError } = await import("@/lib/downloader/engine.server");
         const { probeVideo } = await import("@/lib/downloader/probe.server");

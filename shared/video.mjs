@@ -18,6 +18,15 @@ export const OUTPUTS = /** @type {const} */ (["mp4", "mp4-silent", "mp3"]);
 export const MAX_BATCH_URLS = 20;
 export const MAX_SHARE_TEXT = 32_768;
 
+/**
+ * yt-dlp's resumable leftovers: partial downloads, fragment state and separate
+ * format streams (`name.f137.mp4`) that are merged after every stream finishes.
+ * @param {string} name
+ */
+export function isVideoScratch(name) {
+  return /(?:\.part(?:-Frag\d+)?|\.ytdl|\.f\d+[\w.-]*\.[a-z0-9]+)$/i.test(name);
+}
+
 /** @param {unknown} raw @returns {string | null} */
 export function normalizeFileUrl(raw) {
   if (typeof raw !== "string") return null;

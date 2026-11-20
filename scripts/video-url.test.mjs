@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   extractVideoUrls,
+  isVideoScratch,
   MAX_SHARE_TEXT,
   normalizeVideoUrl,
   OUTPUTS,
@@ -104,5 +105,20 @@ test("all output formats disable subtitle downloads and embedding", () => {
     for (const flag of ["--no-write-subs", "--no-write-auto-subs", "--no-embed-subs"]) {
       assert.ok(args.includes(flag), `${output} is missing ${flag}`);
     }
+  }
+});
+
+test("recognizes resumable yt-dlp leftovers but not finished files", () => {
+  for (const name of [
+    "片段 [abcDEF123_9].mp4.part",
+    "片段 [abcDEF123_9].mp4.part-Frag12",
+    "片段 [abcDEF123_9].mp4.ytdl",
+    "片段 [abcDEF123_9].f137.mp4",
+    "片段 [abcDEF123_9] [1080p].f140.m4a",
+  ]) {
+    assert.equal(isVideoScratch(name), true, name);
+  }
+  for (const name of ["片段 [abcDEF123_9].mp4", "Track.f1 [abcDEF123_9].mp3", "notes.txt"]) {
+    assert.equal(isVideoScratch(name), false, name);
   }
 });

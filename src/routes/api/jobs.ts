@@ -27,17 +27,14 @@ export const Route = createFileRoute("/api/jobs")({
         if (guarded) return guarded;
         const input = await readDownloadRequest(request);
         if (input instanceof Response) return input;
-        const body =
-          input && typeof input === "object"
-            ? (input as {
-                url?: unknown;
-                urls?: unknown;
-                quality?: unknown;
-                output?: unknown;
-                accelerate?: unknown;
-                lang?: unknown;
-              })
-            : {};
+        const body: {
+          url?: unknown;
+          urls?: unknown;
+          quality?: unknown;
+          output?: unknown;
+          accelerate?: unknown;
+          lang?: unknown;
+        } = input;
         const locale = parseLocale(body.lang ?? new URL(request.url).searchParams.get("lang"));
         const { DownloadError, enqueueJobs, startJob } =
           await import("@/lib/downloader/engine.server");

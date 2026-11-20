@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { appendFile, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -622,3 +622,20 @@ for (const mode of ["CLI", "desktop"]) {
     },
   );
 }
+
+test(
+  "a checkpoint that cannot be saved fails the transfer as a write error",
+  { skip: curlMissing },
+  async (t) => {
+    const server = await fixture(t, (_req, res) => {
+      res.writeHead(200, { ETag: '"unsaved"', "Content-Length": 4 });
+      res.end("data");
+    });
+    if (!server) return;
+    // A directory in the temporary file's place makes the checkpoint write fail.
+    await mkdir(path.join(server.directory, "transfer.json.tmp"));
+    await assert.rejects(downloadDirectFile(server), { kind: "write" });
+    assert.equal(await hasDirectCheckpoint(server.directory, server.url), false);
+    assert.deepEqual((await readdir(server.directory)).sort(), ["transfer.json.tmp"]);
+  },
+);

@@ -5,6 +5,7 @@ if [ "$(uname -s)" != Darwin ]; then
   echo "Build the macOS package on a Mac." >&2
   exit 1
 fi
+cd "$(dirname "$0")/.."
 mode=$1
 shift
 if [ "$#" -eq 0 ] && [ -d node_modules/electron/dist/Electron.app ]; then
@@ -25,6 +26,12 @@ case "$mode" in
   *) echo "Expected local or release." >&2; exit 1 ;;
 esac
 
+# Unpacked bundles left in release/ by older builds can predate the current CSP.
+# This script only exports disk images, so remove those stale apps first.
+for stale in release/mac*/*.app release/*/mac*/*.app; do
+  if [ -d "$stale" ]; then rm -rf "$stale"; fi
+done
+
 # Signing in a local temporary directory keeps Desktop/iCloud metadata out of the bundle.
 stage=$(mktemp -d /private/tmp/luopian-package.XXXXXXXX)
 trap 'rm -rf "$stage"' EXIT
@@ -32,6 +39,7 @@ npm run build:desktop
 electron-builder --mac dmg dir "$@" "-c.directories.output=$stage" --publish never
 
 for app in "$stage"/mac*/落片.app; do
+  node scripts/desktop-bundle-check.mjs "$app/Contents/Resources/luopian"
   codesign --verify --deep --strict "$app"
   if [ "$mode" = release ]; then
     xcrun stapler validate "$app"

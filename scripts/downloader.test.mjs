@@ -722,3 +722,148 @@ test("mutations accept the same browser origin and bound JSON request bodies", a
   });
   assert.equal((await readDownloadRequest(large)).status, 413);
 });
+
+test("request bodies report empty, malformed and unreadable input separately", async () => {
+  const url = "http://127.0.0.1:8080/api/jobs?lang=en";
+  const headers = { "content-type": "application/json" };
+  const read = async (body, init = {}) => {
+    const response = await readDownloadRequest(
+      new Request(url, { method: "POST", headers, body, ...init }),
+    );
+    assert.ok(response instanceof Response);
+    return [response.status, (await response.json()).error];
+  };
+  assert.deepEqual(await read(undefined), [400, "The request body is empty."]);
+  assert.deepEqual(await read("  "), [400, "The request body is empty."]);
+  for (const body of ['{"url":', "[1]", "null", '"text"']) {
+    assert.deepEqual(await read(body), [400, "The request body is not a valid JSON object."]);
+  }
+  const broken = new ReadableStream({
+    pull(controller) {
+      controller.error(new Error("connection reset"));
+    },
+  });
+  assert.deepEqual(await read(broken, { duplex: "half" }), [
+    400,
+    "The request body could not be read. Try again.",
+  ]);
+});
+
+portable("a canceled queued job never starts when its manifest cannot be saved", async (t) => {
+  mockDisk(t, async () => ampleDisk);
+  const active = await engine.startJob(input(hanging));
+  await waitFor(active, (item) => item.percent === 42);
+  const [queued] = await engine.enqueueJobs({ urls: [video(good)], lang: "en" });
+  const rename = fs.rename;
+  const failing = t.mock.method(fs, "rename", async (from, to) => {
+    if (to === path.join(root, queued.id, jobManifest)) {
+      throw Object.assign(new Error("I/O error"), { code: "EIO" });
+    }
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    failing.mock.restore();
+    syncBuiltinESMExports();
+  });
+  assert.equal((await engine.cancelJob(queued.id)).status, "canceled");
+  failing.mock.restore();
+  syncBuiltinESMExports();
+  // A restart must not find the job queued on disk either.
+  await assert.rejects(access(path.join(root, queued.id)), { code: "ENOENT" });
+
+  await engine.cancelJob(active.id);
+  await waitFor(active, (item) => item.status === "canceled");
+  await sleep(300);
+  assert.equal((await engine.getJob(queued.id)).status, "canceled");
+  assert.ok((await engine.listJobs()).every((job) => job.status !== "running"));
+});
+
+function restoreIn(directory, script) {
+  return exec(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", script],
+    { env: { ...process.env, LUOPIAN_ROOT: directory }, timeout: 15000 },
+  );
+}
+
+async function saveManifest(directory, id, saved) {
+  await mkdir(path.join(directory, id), { recursive: true });
+  await writeFile(path.join(directory, id, jobManifest), JSON.stringify(saved));
+}
+
+portable("restoring skips manifests whose visible fields have the wrong type", async () => {
+  const directory = await mkdtemp(path.join(temp, "restore-"));
+  const now = Date.now();
+  const valid = randomUUID();
+  const damaged = {
+    [randomUUID()]: { filename: { name: "x.mp4" } },
+    [randomUUID()]: { error: { message: "Failed" } },
+    [randomUUID()]: { percent: "50" },
+    [randomUUID()]: { speed: 3 },
+    [randomUUID()]: { bytes: -1 },
+  };
+  for (const [id, fields] of [[valid, {}], ...Object.entries(damaged)]) {
+    await saveManifest(directory, id, {
+      schema: 1,
+      ownerPid: process.pid,
+      locale: "en",
+      finishedAt: now,
+      view: {
+        ...input(good),
+        id,
+        status: "error",
+        percent: null,
+        speed: null,
+        eta: null,
+        filename: null,
+        bytes: null,
+        error: "Failed",
+        startedAt: now - 1000,
+        ...fields,
+      },
+    });
+  }
+  const { stdout } = await restoreIn(
+    directory,
+    `const { listJobs } = await import(${JSON.stringify(engineUrl)}); console.log(JSON.stringify(await listJobs()));`,
+  );
+  assert.deepEqual(
+    JSON.parse(stdout).map((job) => job.id),
+    [valid],
+  );
+});
+
+portable("expired job folders are removed without another request", async () => {
+  const directory = await mkdtemp(path.join(temp, "expiry-"));
+  const id = randomUUID();
+  const finishedAt = Date.now() - 3 * 60 * 60 * 1000 + 1500;
+  await saveManifest(directory, id, {
+    schema: 1,
+    ownerPid: process.pid,
+    locale: "en",
+    finishedAt,
+    view: {
+      ...input(good),
+      id,
+      status: "canceled",
+      percent: null,
+      speed: null,
+      eta: null,
+      filename: null,
+      bytes: null,
+      error: null,
+      startedAt: finishedAt - 1000,
+    },
+  });
+  const { stdout } = await restoreIn(
+    directory,
+    `const { access } = await import("node:fs/promises");
+const { listJobs } = await import(${JSON.stringify(engineUrl)});
+const listed = (await listJobs()).length;
+await new Promise((resolve) => setTimeout(resolve, 4500));
+const exists = await access(${JSON.stringify(path.join(directory, id))}).then(() => true, () => false);
+console.log(JSON.stringify({ listed, exists }));`,
+  );
+  assert.deepEqual(JSON.parse(stdout), { listed: 1, exists: false });
+});

@@ -31,6 +31,7 @@ import {
   extractDownloadUrls,
   isOutput,
   isQuality,
+  isVideoScratch,
   MAX_SHARE_TEXT,
   normalizeVideoUrl,
   outputExtension,
@@ -271,8 +272,66 @@ async function restoreStaging(outDir, prefix, directory) {
   return false;
 }
 
+const stagingMaxAge = 7 * 24 * 60 * 60 * 1000;
+const stagingMaxBytes = 10 * 1024 ** 3;
+const stagingName = /^\.luopian-(?:resume-([0-9a-f]{24})|work-([0-9a-f]{24})-(\d+)-[^/\\]*)$/;
+
+async function stagingUsage(directory) {
+  let bytes = 0;
+  let modified = (await lstat(directory)).mtimeMs;
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const item = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      const inner = await stagingUsage(item);
+      bytes += inner.bytes;
+      modified = Math.max(modified, inner.modified);
+    } else {
+      const details = await lstat(item);
+      bytes += details.size;
+      modified = Math.max(modified, details.mtimeMs);
+    }
+  }
+  return { bytes, modified };
+}
+
+async function stagingOwnerAlive(directory, owner) {
+  if (processIsAlive(owner)) return true;
+  try {
+    const writer = Number(await readFile(path.join(directory, "writer"), "utf8"));
+    return Number.isSafeInteger(writer) && writer > 0 && processIsAlive(windows ? writer : -writer);
+  } catch {
+    return false;
+  }
+}
+
+// Checkpoints for other links or settings are never looked up again. Remove the
+// ones untouched for a week, then the oldest while they exceed the size cap.
+async function pruneStaging(outDir, currentId) {
+  const candidates = [];
+  for (const entry of await readdir(outDir, { withFileTypes: true })) {
+    const match = stagingName.exec(entry.name);
+    if (!entry.isDirectory() || !match || (match[1] ?? match[2]) === currentId) continue;
+    const directory = path.join(outDir, entry.name);
+    try {
+      if (match[3] && (await stagingOwnerAlive(directory, Number(match[3])))) continue;
+      candidates.push({ directory, ...(await stagingUsage(directory)) });
+    } catch {
+      // Another process may have just moved or removed it.
+    }
+  }
+  candidates.sort((a, b) => a.modified - b.modified);
+  let total = candidates.reduce((sum, item) => sum + item.bytes, 0);
+  const now = Date.now();
+  for (const item of candidates) {
+    if (now - item.modified < stagingMaxAge && total <= stagingMaxBytes) break;
+    await rm(item.directory, { recursive: true, force: true }).catch(() => undefined);
+    total -= item.bytes;
+  }
+}
+
 async function withStaging(outDir, key, action, retain) {
   const id = createHash("sha256").update(key).digest("hex").slice(0, 24);
+  await pruneStaging(outDir, id).catch(() => undefined);
   const checkpoint = path.join(outDir, `.luopian-resume-${id}`);
   const prefix = `.luopian-work-${id}-`;
   const temporary = await mkdtemp(path.join(outDir, `${prefix}${process.pid}-`));
@@ -392,14 +451,15 @@ async function completedFile(record, directory, output) {
   throw new CliError(copy.noFile);
 }
 
+// Shares the desktop app's rule, so finished format streams survive an interruption too.
 async function keepVideoParts(directory) {
   let hasPart = false;
   for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const partial = /\.part(?:-Frag\d+)?$/i.test(entry.name);
-    if (entry.isFile() && (partial || entry.name.endsWith(".ytdl"))) {
-      hasPart ||= partial;
+    const item = path.join(directory, entry.name);
+    if (entry.isFile() && isVideoScratch(entry.name)) {
+      hasPart ||= (await lstat(item)).size > 0;
     } else {
-      await rm(path.join(directory, entry.name), { recursive: true, force: true });
+      await rm(item, { recursive: true, force: true });
     }
   }
   return hasPart;

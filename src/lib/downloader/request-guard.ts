@@ -41,32 +41,42 @@ export function guardStudioMutation(request: Request, requireJson = true): Respo
   return null;
 }
 
-export async function readDownloadRequest(request: Request): Promise<unknown> {
+// Returns the JSON object body, or a 400/413 response that names the actual problem.
+export async function readDownloadRequest(
+  request: Request,
+): Promise<Record<string, unknown> | Response> {
+  const text = downloadMessages(parseLocale(new URL(request.url).searchParams.get("lang")));
   const reader = request.body?.getReader();
-  if (!reader) return null;
+  if (!reader) return jobJson({ error: text.emptyRequest }, 400);
   const decoder = new TextDecoder();
   let remaining = MAX_REQUEST_BYTES;
-  let text = "";
+  let body = "";
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return JSON.parse(text + decoder.decode()) as unknown;
+      if (done) break;
       remaining -= value.byteLength;
       if (remaining < 0) {
         void reader.cancel().catch(() => undefined);
-        return jobJson(
-          {
-            error: downloadMessages(parseLocale(new URL(request.url).searchParams.get("lang")))
-              .requestTooLarge,
-          },
-          413,
-        );
+        return jobJson({ error: text.requestTooLarge }, 413);
       }
-      text += decoder.decode(value, { stream: true });
+      body += decoder.decode(value, { stream: true });
     }
+    body += decoder.decode();
   } catch {
-    return null;
+    return jobJson({ error: text.unreadableRequest }, 400);
   } finally {
     reader.releaseLock();
   }
+  if (!body.trim()) return jobJson({ error: text.emptyRequest }, 400);
+  let input: unknown;
+  try {
+    input = JSON.parse(body);
+  } catch {
+    return jobJson({ error: text.malformedJson }, 400);
+  }
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return jobJson({ error: text.malformedJson }, 400);
+  }
+  return input as Record<string, unknown>;
 }

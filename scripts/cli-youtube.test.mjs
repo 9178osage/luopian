@@ -1,7 +1,16 @@
 import { strict as assert } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  truncateSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -97,6 +106,10 @@ const extension = args.includes("--audio-format") && process.env.LUOPIAN_TEST_MO
   ? "mp3"
   : "mp4";
 const output = "example." + extension;
+if (process.env.LUOPIAN_TEST_MODE === "interrupted-format") {
+  writeFileSync("example.f137.mp4", "finished video stream");
+  process.exit(8);
+}
 if (process.env.LUOPIAN_TEST_MODE === "interrupted-conversion") {
   writeFileSync(output, "truncated conversion");
   writeFileSync("stream.part", "resumable bytes");
@@ -112,6 +125,9 @@ if (process.env.LUOPIAN_TEST_MODE === "signal") {
 } else {
   const out = process.env.LUOPIAN_TEST_MODE === "outside" ? "../outside.mp4" : output;
   if (process.env.LUOPIAN_TEST_MODE === "resume" && !existsSync("stream.part")) process.exit(12);
+  if (process.env.LUOPIAN_TEST_MODE === "resume-format" && !existsSync("example.f137.mp4")) {
+    process.exit(12);
+  }
   if (!existsSync(out)) writeFileSync(out, "sample video bytes");
   writeFileSync(args[args.indexOf("--print-to-file") + 2], JSON.stringify(out) + "\\n");
 }
@@ -361,5 +377,56 @@ test(
     });
     assert.equal(missingAria.status, 0, missingAria.stderr);
     assert.match(missingAria.stderr, /could not run aria2c/i);
+  },
+);
+
+test(
+  "CLI keeps finished format streams from an interrupted download",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const { env, outDir } = fixture(t);
+    const args = ["-o", outDir, url];
+    const interrupted = runCli(args, { env: { ...env, LUOPIAN_TEST_MODE: "interrupted-format" } });
+    assert.equal(interrupted.status, 1);
+    const [checkpoint] = readdirSync(outDir);
+    assert.match(checkpoint, /^\.luopian-resume-/);
+    assert.deepEqual(readdirSync(path.join(outDir, checkpoint)), ["example.f137.mp4"]);
+
+    const resumed = runCli(args, { env: { ...env, LUOPIAN_TEST_MODE: "resume-format" } });
+    assert.equal(resumed.status, 0, resumed.stderr);
+    assert.deepEqual(readdirSync(outDir), ["example.mp4"]);
+  },
+);
+
+test(
+  "CLI removes abandoned checkpoints by age and total size, but not live ones",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const { env, outDir } = fixture(t);
+    mkdirSync(outDir, { recursive: true });
+    const name = (kind, digit) => `.luopian-${kind}-${digit.repeat(24)}`;
+    const checkpoint = (entry, { bytes = 1, time } = {}) => {
+      const directory = path.join(outDir, entry);
+      mkdirSync(directory);
+      const file = path.join(directory, "transfer.part");
+      writeFileSync(file, "x");
+      // Sparse files keep the size-cap fixture fast.
+      if (bytes > 1) truncateSync(file, bytes);
+      if (time) {
+        utimesSync(file, time, time);
+        utimesSync(directory, time, time);
+      }
+    };
+    const week = 8 * 24 * 60 * 60 * 1000;
+    const live = `${name("work", "b")}-${process.pid}-abc123`;
+    checkpoint(name("resume", "a"), { time: new Date(Date.now() - week) });
+    checkpoint(live, { time: new Date(Date.now() - week) });
+    checkpoint(name("resume", "c"), { bytes: 6 * 1024 ** 3, time: new Date(Date.now() - 60_000) });
+    checkpoint(name("resume", "d"), { bytes: 6 * 1024 ** 3 });
+    writeFileSync(path.join(outDir, "keep.mp4"), "user file");
+
+    const result = runCli(["-o", outDir, url], { env: { ...env, LUOPIAN_TEST_MODE: "exit" } });
+    assert.equal(result.status, 1);
+    assert.deepEqual(readdirSync(outDir).sort(), [name("resume", "d"), live, "keep.mp4"].sort());
   },
 );

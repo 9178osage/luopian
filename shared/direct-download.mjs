@@ -213,6 +213,8 @@ function run(options, command, args, backend, { onSpawn, onHeaders } = {}) {
     let headerSaved;
     /** @type {NodeJS.ErrnoException | undefined} */
     let error;
+    /** @type {NodeJS.ErrnoException | undefined} */
+    let checkpointError;
     const progress = (/** @type {string} */ chunk) => {
       const lines = (tail + chunk).split(/[\r\n]/);
       tail = (lines.pop() ?? "").slice(-2000);
@@ -231,7 +233,13 @@ function run(options, command, args, backend, { onSpawn, onHeaders } = {}) {
         if (onHeaders && !headerSaved && child.pid) {
           const heads = stdout.split(/\r?\n\r?\n/);
           const head = heads.slice(0, -1).find((part) => /^HTTP\/\S+ [2-5]\d\d\b/.test(part));
-          if (head) headerSaved = onHeaders(head, child.pid).catch(() => undefined);
+          if (head) {
+            // Bytes written without a saved checkpoint could not be verified after a crash.
+            headerSaved = onHeaders(head, child.pid).catch((cause) => {
+              checkpointError = cause;
+              if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+            });
+          }
         }
       }
     });
@@ -248,12 +256,18 @@ function run(options, command, args, backend, { onSpawn, onHeaders } = {}) {
       await headerSaved;
       const diskFull =
         (backend === "aria2" && code === 9) ||
-        (code === 23 && /no space left|disk quota exceeded|disk is full/i.test(stderr));
+        (code === 23 && /no space left|disk quota exceeded|disk is full/i.test(stderr)) ||
+        checkpointError?.code === "ENOSPC" ||
+        checkpointError?.code === "EDQUOT";
       resolve({
         code,
         stdout,
         error,
-        writeFailure: diskFull ? "space" : backend === "curl" && code === 23 ? "write" : null,
+        writeFailure: diskFull
+          ? "space"
+          : checkpointError || (backend === "curl" && code === 23)
+            ? "write"
+            : null,
       });
     });
     const writerSaved = child.pid
